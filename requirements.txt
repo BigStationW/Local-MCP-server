@@ -1,5 +1,8 @@
-httpx
-beautifulsoup4
-mcp[cli]
+fastmcp
 playwright
+beautifulsoup4
+httpx[http2]
+trafilatura
+ddgs
+uvicorn
 starlette
