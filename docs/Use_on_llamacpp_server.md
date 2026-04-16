@@ -1,5 +1,5 @@
 # Installation
-Assuming you're already on the http://127.0.0.1:5001/ web page
+Assuming that Local-MCP-server is active (by double clicking on launch.bat) and that you're already on the http://127.0.0.1:5001/ web page
 1) On top left of the page, click on **MCP Servers**
 2) On **Manage Servers** click on **Add New Server**
 3) Paste the ```http://localhost:4242/mcp``` link in there and click on **Add**
