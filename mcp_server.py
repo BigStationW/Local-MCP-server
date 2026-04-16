@@ -18,6 +18,12 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
 # ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+
+SERVER_PORT = 4242  # overwritten at startup from CLI args
+
+# ---------------------------------------------------------------------------
 # SCREENSHOT STORAGE
 # ---------------------------------------------------------------------------
 
@@ -54,7 +60,6 @@ class FastMCPWithCORS(FastMCP):
 
     def streamable_http_app(self) -> Starlette:
         app = super().streamable_http_app()
-        # Inject extra routes
         app.routes.extend(self._build_extra_routes())
         return self._add_cors(app)
 
@@ -103,11 +108,7 @@ def save_screenshot(data: bytes, prefix: str = "screenshot") -> str:
     filename = f"{prefix}_{int(datetime.now().timestamp())}.png"
     filepath = SCREENSHOT_DIR / filename
     filepath.write_bytes(data)
-    
-    # The URL that SillyTavern needs to fetch
-    url = f"http://localhost:6969/screenshots/{filename}"
-    
-    # Return as Markdown so the UI renders it
+    url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
     return f"![{filename}]({url})"
 
 
@@ -161,12 +162,12 @@ async def http_get_image(url: str, user_agent: str = None) -> str:
         resp = await client.get(url, headers=headers)
         mime_type = resp.headers.get("content-type", "image/jpeg")
         ext = mime_type.split("/")[-1].split(";")[0] if "/" in mime_type else "jpeg"
-        
+
         filename = f"image_{int(datetime.now().timestamp())}.{ext}"
         filepath = SCREENSHOT_DIR / filename
         filepath.write_bytes(resp.content)
 
-        public_url = f"http://localhost:6969/screenshots/{filename}"
+        public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
         return f"![Image]({public_url})"
 
 
@@ -282,24 +283,15 @@ if __name__ == "__main__":
         "--port", "-p",
         type=int,
         default=4242,
-        help="Port to run the server on (default: 6969)"
+        help="Port to run the server on (default: 4242)"
     )
     args = parser.parse_args()
 
-    # Apply the port dynamically
+    # Set the global port so save_screenshot / http_get_image use it
+    SERVER_PORT = args.port
     mcp.settings.port = args.port
 
-    # Also fix the screenshot URLs to use the correct port
-    # (patch the save_screenshot function)
-    _original_save = save_screenshot
-    def save_screenshot(data: bytes, prefix: str = "screenshot") -> str:
-        filename = f"{prefix}_{int(datetime.now().timestamp())}.png"
-        filepath = SCREENSHOT_DIR / filename
-        filepath.write_bytes(data)
-        url = f"http://localhost:{args.port}/screenshots/{filename}"
-        return f"![{filename}]({url})"
-
-    # --- THE FIX: Disable colors in Uvicorn's default config dict ---
+    # --- Disable colors in Uvicorn's default config dict ---
     import uvicorn
     if "default" in uvicorn.config.LOGGING_CONFIG["formatters"]:
         uvicorn.config.LOGGING_CONFIG["formatters"]["default"]["use_colors"] = False
@@ -307,5 +299,5 @@ if __name__ == "__main__":
         uvicorn.config.LOGGING_CONFIG["formatters"]["access"]["use_colors"] = False
 
     print(f"Web Tools MCP Server is running!")
-    print(f"Connect your AI client at:  http://localhost:{args.port}/mcp")
+    print(f"Connect your AI client at:  http://localhost:{SERVER_PORT}/mcp")
     mcp.run(transport="streamable-http")
