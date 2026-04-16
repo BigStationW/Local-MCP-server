@@ -6,3 +6,4 @@ trafilatura
 ddgs
 uvicorn
 starlette
+Pillow
