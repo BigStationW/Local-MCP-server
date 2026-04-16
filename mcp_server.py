@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from playwright.async_api import async_playwright
 from starlette.middleware.cors import CORSMiddleware
 from starlette.applications import Starlette
@@ -103,14 +103,14 @@ def parse_html_text(html_content: str) -> str:
     return soup.get_text(separator="\n", strip=True)
 
 
-def save_screenshot(data: bytes, prefix: str = "screenshot") -> str:
-    """Save screenshot bytes to disk, return the Markdown image tag."""
+def save_screenshot(data: bytes, prefix: str = "screenshot") -> tuple[str, Image]:
+    """Save screenshot bytes to disk, return (public_url_string, Image_object)."""
     filename = f"{prefix}_{int(datetime.now().timestamp())}.png"
     filepath = SCREENSHOT_DIR / filename
     filepath.write_bytes(data)
     url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
-    return f"![{filename}]({url})"
-
+    img = Image(data=data, format="png")
+    return url, img
 
 # ---------------------------------------------------------------------------
 # BASIC TOOLS
@@ -155,20 +155,21 @@ async def http_get_text(url: str, user_agent: str = None, referer: str = None) -
 
 
 @mcp.tool()
-async def http_get_image(url: str, user_agent: str = None) -> str:
-    """Download an image and display it in chat."""
+async def http_get_image(url: str, user_agent: str = None) -> list:
+    """Download an image and display it — model can now actually see it."""
     headers = {"User-Agent": user_agent or "Mozilla/5.0"}
     async with httpx.AsyncClient(follow_redirects=True) as client:
         resp = await client.get(url, headers=headers)
         mime_type = resp.headers.get("content-type", "image/jpeg")
-        ext = mime_type.split("/")[-1].split(";")[0] if "/" in mime_type else "jpeg"
+        fmt = mime_type.split("/")[-1].split(";")[0] if "/" in mime_type else "jpeg"
 
-        filename = f"image_{int(datetime.now().timestamp())}.{ext}"
+        filename = f"image_{int(datetime.now().timestamp())}.{fmt}"
         filepath = SCREENSHOT_DIR / filename
         filepath.write_bytes(resp.content)
 
         public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
-        return f"![Image]({public_url})"
+        img = Image(data=resp.content, format=fmt)
+        return [f"Image available at: {public_url}", img]
 
 
 @mcp.tool()
@@ -192,9 +193,9 @@ async def web_search(query: str, page: int = 0, user_agent: str = None) -> str:
 async def puppeteer_screenshot(
     url: str,
     wait_until: str = "networkidle",
-    wait_for_selector: str = None
-) -> str:
-    """Take a full-page screenshot of a webpage. Returns a URL to view the screenshot."""
+    wait_for_selector: str = None,
+) -> list:
+    """Take a full-page screenshot of a webpage. Returns the image so the model can see it."""
     browser = await browser_manager.get_browser()
     page = await browser.new_page()
     try:
@@ -202,8 +203,9 @@ async def puppeteer_screenshot(
         if wait_for_selector:
             await page.wait_for_selector(wait_for_selector, timeout=15000)
         data = await page.screenshot(full_page=True)
-        url_out = save_screenshot(data)
-        return f"Screenshot saved. View it at: {url_out}"
+        public_url, img = save_screenshot(data)
+        # Return BOTH: a text note for the human UI and the actual image for the model
+        return [f"Screenshot available at: {public_url}", img]
     finally:
         await page.close()
 
@@ -223,15 +225,15 @@ async def puppeteer_session_create(url: str, wait_until: str = "networkidle") ->
 
 
 @mcp.tool()
-async def puppeteer_session_screenshot(session_id: str) -> str:
-    """Take a screenshot of a running session. Returns a URL to view the screenshot."""
+async def puppeteer_session_screenshot(session_id: str) -> list:
+    """Take a screenshot of a running session. Returns the image so the model can see it."""
     page = browser_manager.sessions.get(session_id)
     if not page:
         return "Error: No session found with that session_id."
 
     data = await page.screenshot(full_page=True)
-    url_out = save_screenshot(data, prefix=session_id)
-    return f"Screenshot saved. View it at: {url_out}"
+    public_url, img = save_screenshot(data, prefix=session_id)
+    return [f"Screenshot available at: {public_url}", img]
 
 
 @mcp.tool()
