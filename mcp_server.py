@@ -272,12 +272,12 @@ async def image_search(query: str, max_results: int = 5) -> list:
                 if fmt not in ("png", "jpeg", "jpg", "gif", "webp"):
                     fmt = "jpeg"
 
+                normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
                 filename = f"imgsearch_{int(datetime.now().timestamp())}_{downloaded}.{normalized_fmt}"
                 filepath = SCREENSHOT_DIR / filename
                 filepath.write_bytes(normalized_data)
 
                 public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
-                normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
                 img = Image(data=normalized_data, format=normalized_fmt)
 
                 out.append(f'Result {downloaded + 1}: "{title}" — source: {source}')
@@ -681,6 +681,76 @@ async def puppeteer_session_type(session_id: str, selector: str, text: str) -> s
         return f"Typed into {selector}: {text}"
     except Exception as e:
         return f"Type error: {str(e)}"
+
+@mcp.tool()
+async def puppeteer_session_evaluate(session_id: str, script: str) -> str:
+    """
+    Execute arbitrary JavaScript in the page and return the result as a string.
+    Extremely useful for extracting specific DOM attributes, href values, data
+    attributes, etc. that no other tool exposes.
+    """
+    page = browser_manager.sessions.get(session_id)
+    if not page:
+        return f"Error: No session found with session_id '{session_id}'."
+    try:
+        result = await page.evaluate(script)
+        if result is None:
+            return "null (element not found or script returned nothing)"
+        # Serialize non-string results
+        if not isinstance(result, str):
+            import json
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        return result
+    except Exception as e:
+        return f"JavaScript evaluation error: {str(e)}"
+    
+@mcp.tool()
+async def puppeteer_session_get_element_html(
+    session_id: str,
+    selector: str,
+    outer: bool = True,
+) -> str:
+    """
+    Return the innerHTML (or outerHTML) of the first element matching `selector`.
+    Much cheaper than getting the full page HTML when you only care about one section.
+    
+    Args:
+        selector: CSS selector, e.g. '.postContainer', 'article'
+        outer:    True  → includes the element's own tag (outerHTML)
+                  False → only the element's children (innerHTML)
+    """
+    page = browser_manager.sessions.get(session_id)
+    if not page:
+        return f"Error: No session found with session_id '{session_id}'."
+    try:
+        prop = "outerHTML" if outer else "innerHTML"
+        html = await page.evaluate(
+            f"el => el ? el.{prop} : null",
+            await page.query_selector(selector)
+        )
+        if html is None:
+            return f"No element found for selector: {selector}"
+        return html[:20000]   # cap so it doesn't blow the context
+    except Exception as e:
+        return f"Error getting element HTML: {str(e)}"
+    
+@mcp.tool()
+async def puppeteer_session_get_page_html(
+    session_id: str,
+    max_chars: int = 30000,
+) -> str:
+    """
+    Return the current fully-rendered HTML of the page (after JS has run).
+    Use get_element_html with a narrow selector instead when possible —
+    this can be very large. Capped at max_chars characters.
+    """
+    page = browser_manager.sessions.get(session_id)
+    if not page:
+        return f"Error: No session found with session_id '{session_id}'."
+    try:
+        return (await page.content())[:max_chars]
+    except Exception as e:
+        return f"Error getting page HTML: {str(e)}"
 
 # ---------------------------------------------------------------------------
 # SERVER RUNNER
