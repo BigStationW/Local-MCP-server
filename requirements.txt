@@ -1,0 +1,5 @@
+httpx
+beautifulsoup4
+mcp[cli]
+playwright
+starlette
