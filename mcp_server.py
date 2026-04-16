@@ -200,23 +200,143 @@ def date_time() -> str:
     """Get the current date and time."""
     return datetime.now().strftime("%d/%m/%Y - %H:%M")
 
-@mcp.tool()
-async def cleanup_screenshots(older_than_seconds: int = 3600) -> str:
-    """Delete screenshots older than N seconds (default: 1 hour)."""
-    now = datetime.now().timestamp()
-    deleted = 0
-    for f in SCREENSHOT_DIR.glob("*.png"):
-        try:
-            if (now - f.stat().st_mtime) > older_than_seconds:
-                f.unlink()
-                deleted += 1
-        except Exception as e:
-            logging.warning(f"Failed to delete {f}: {e}")
-    return f"Deleted {deleted} old screenshots."
-
 # ---------------------------------------------------------------------------
 # HTTP / WEB TOOLS
 # ---------------------------------------------------------------------------
+@mcp.tool()
+async def image_search(query: str, max_results: int = 5) -> list:
+    """
+    Search for images and return them so the model can see them directly.
+    Uses DuckDuckGo image search to find direct image URLs, then downloads them.
+    Much more efficient than web_search + navigate + screenshot for finding images.
+    """
+    try:
+        results = []
+        with DDGS() as ddgs:
+            hits = list(ddgs.images(query, max_results=max_results))
+
+        if not hits:
+            return ["No image results found."]
+
+        client = await get_http_client()
+        out = []
+        downloaded = 0
+
+        for hit in hits:
+            image_url = hit.get("image", "")
+            title = hit.get("title", "No title")
+            source = hit.get("url", "")
+
+            if not image_url:
+                continue
+
+            try:
+                resp = await client.get(image_url, timeout=10)
+                resp.raise_for_status()
+
+                mime = resp.headers.get("content-type", "image/jpeg")
+                fmt = mime.split("/")[-1].split(";")[0].strip() or "jpeg"
+                # Normalize weird formats
+                if fmt not in ("png", "jpeg", "jpg", "gif", "webp"):
+                    fmt = "jpeg"
+
+                filename = f"imgsearch_{int(datetime.now().timestamp())}_{downloaded}.{fmt}"
+                filepath = SCREENSHOT_DIR / filename
+                filepath.write_bytes(resp.content)
+
+                public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
+                img = Image(data=resp.content, format=fmt)
+
+                out.append(f'Result {downloaded + 1}: "{title}" — source: {source}')
+                out.append(f"Image URL: {public_url}")
+                out.append(img)
+
+                downloaded += 1
+                if downloaded >= max_results:
+                    break
+
+            except Exception:
+                # Silently skip images that fail to download (dead links, hotlink protection, etc.)
+                continue
+
+        if not out:
+            return ["Found results but could not download any images (hotlink protection or dead links). Try puppeteer_screenshot on one of these pages instead."] + \
+                   [f"- {h.get('title','')}: {h.get('image','')}" for h in hits[:5]]
+
+        return out
+
+    except Exception as e:
+        return [f"Image search error: {str(e)}"]
+
+
+@mcp.tool()
+async def puppeteer_session_find_images(
+    session_id: str,
+    min_width: int = 200,
+    min_height: int = 200,
+    limit: int = 10,
+) -> list:
+    """
+    Extract direct image URLs from the current page of a session.
+    Filters by minimum dimensions so you get actual content images, not icons/logos.
+    Returns a list of src URLs + downloads the top image so the model can see it.
+    Use this after navigating to an art page (DeviantArt, ArtStation, Pixiv, etc.)
+    to grab the real artwork URL instead of screenshotting the entire page.
+    """
+    page = browser_manager.sessions.get(session_id)
+    if not page:
+        return [f"Error: No session found with session_id '{session_id}'."]
+
+    try:
+        images = await page.evaluate(f"""
+            () => {{
+                const imgs = Array.from(document.querySelectorAll('img'));
+                return imgs
+                    .filter(img => img.naturalWidth >= {min_width} && img.naturalHeight >= {min_height})
+                    .map(img => ({{
+                        src: img.src || img.currentSrc || '',
+                        alt: img.alt || '',
+                        width: img.naturalWidth,
+                        height: img.naturalHeight
+                    }}))
+                    .filter(img => img.src && img.src.startsWith('http'))
+                    .sort((a, b) => (b.width * b.height) - (a.width * a.height))
+                    .slice(0, {limit});
+            }}
+        """)
+
+        if not images:
+            return [f"No images found with minimum size {min_width}x{min_height}px."]
+
+        out = [f"Found {len(images)} image(s) on page:\n"]
+        for i, img in enumerate(images, 1):
+            out.append(f"{i}. {img['src']}\n   Alt: {img['alt']} | Size: {img['width']}x{img['height']}px")
+
+        # Auto-download the largest image so the model can see it
+        client = await get_http_client()
+        top = images[0]
+        try:
+            resp = await client.get(top["src"], timeout=10)
+            resp.raise_for_status()
+            mime = resp.headers.get("content-type", "image/jpeg")
+            fmt = mime.split("/")[-1].split(";")[0].strip() or "jpeg"
+            if fmt not in ("png", "jpeg", "jpg", "gif", "webp"):
+                fmt = "jpeg"
+            filename = f"pageimg_{session_id}_{int(datetime.now().timestamp())}.{fmt}"
+            filepath = SCREENSHOT_DIR / filename
+            filepath.write_bytes(resp.content)
+            public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
+            img_obj = Image(data=resp.content, format=fmt)
+            out.append(f"\nLargest image downloaded: {public_url}")
+            out.append(img_obj)
+        except Exception as e:
+            out.append(f"\nCould not auto-download largest image: {e}")
+
+        return out
+
+    except Exception as e:
+        return [f"Error extracting images: {str(e)}"]
+    
 @mcp.tool()
 async def web_search_and_read(query: str, max_results: int = 5, read_top_n: int = 2) -> str:
     """Search the web (DuckDuckGo) and then fetch/extract full text from the top N results.
