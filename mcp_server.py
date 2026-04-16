@@ -2,7 +2,8 @@ import os
 import argparse
 os.environ["TERM"] = "dumb"
 os.environ["NO_COLOR"] = "1"
-
+from PIL import Image as PILImage
+import io
 import asyncio
 import logging
 from datetime import datetime
@@ -175,6 +176,37 @@ def parse_html_text(html_content: str, article_only: bool = False) -> str:
         tag.extract()
     return soup.get_text(separator="\n", strip=True) or ""
 
+def normalize_image_bytes(data: bytes, source_fmt: str) -> tuple[bytes, str]:
+    """
+    Convert image bytes to JPEG if not already PNG/JPEG.
+    llama.cpp's multimodal backend only supports PNG and JPEG.
+    Returns (normalized_bytes, normalized_fmt).
+    """
+    source_fmt = source_fmt.lower().strip()
+    if source_fmt in ("jpeg", "jpg", "png"):
+        # PNG stays PNG, JPEG/JPG both become jpeg
+        return data, "png" if source_fmt == "png" else "jpeg"
+
+    # WebP, GIF, BMP, TIFF, AVIF, etc. → convert to JPEG
+    try:
+        with PILImage.open(io.BytesIO(data)) as img:
+            # Handle transparency (WebP/GIF/PNG with alpha → white background)
+            if img.mode in ("RGBA", "LA", "P"):
+                background = PILImage.new("RGB", img.size, (255, 255, 255))
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                background.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+                img = background
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            return buf.getvalue(), "jpeg"
+    except Exception:
+        # If conversion fails, return original and let the caller handle it
+        return data, source_fmt
+
 def save_screenshot(data: bytes, prefix: str = "screenshot") -> tuple[str, Image]:
     """Save screenshot bytes to disk, return (public_url_string, Image_object)."""
     filename = f"{prefix}_{int(datetime.now().timestamp())}.png"
@@ -240,12 +272,13 @@ async def image_search(query: str, max_results: int = 5) -> list:
                 if fmt not in ("png", "jpeg", "jpg", "gif", "webp"):
                     fmt = "jpeg"
 
-                filename = f"imgsearch_{int(datetime.now().timestamp())}_{downloaded}.{fmt}"
+                filename = f"imgsearch_{int(datetime.now().timestamp())}_{downloaded}.{normalized_fmt}"
                 filepath = SCREENSHOT_DIR / filename
-                filepath.write_bytes(resp.content)
+                filepath.write_bytes(normalized_data)
 
                 public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
-                img = Image(data=resp.content, format=fmt)
+                normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
+                img = Image(data=normalized_data, format=normalized_fmt)
 
                 out.append(f'Result {downloaded + 1}: "{title}" — source: {source}')
                 out.append(f"Image URL: {public_url}")
@@ -326,7 +359,11 @@ async def puppeteer_session_find_images(
             filepath = SCREENSHOT_DIR / filename
             filepath.write_bytes(resp.content)
             public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
-            img_obj = Image(data=resp.content, format=fmt)
+            normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
+            filename = f"pageimg_{session_id}_{int(datetime.now().timestamp())}.{normalized_fmt}"
+            filepath = SCREENSHOT_DIR / filename
+            filepath.write_bytes(normalized_data)
+            img_obj = Image(data=normalized_data, format=normalized_fmt)
             out.append(f"\nLargest image downloaded: {public_url}")
             out.append(img_obj)
         except Exception as e:
@@ -412,7 +449,12 @@ async def http_get_image(url: str, user_agent: str = None) -> list:
         filepath.write_bytes(resp.content)
 
         public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
-        img = Image(data=resp.content, format=fmt)
+        normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
+        filename = f"image_{int(datetime.now().timestamp())}.{normalized_fmt}"
+        filepath = SCREENSHOT_DIR / filename
+        filepath.write_bytes(normalized_data)
+        public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
+        img = Image(data=normalized_data, format=normalized_fmt)
         return [f"Image available at: {public_url}", img]
     except Exception as e:
         return [f"Error downloading image: {str(e)}"]
