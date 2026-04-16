@@ -21,3 +21,4 @@ You're good to go, you can now grab its link: ```http://localhost:4242/mcp```
 <img width="400" height="287" alt="ete" src="https://github.com/user-attachments/assets/321f92fe-bf7e-404e-9346-dcd92c0aadb4" />
 
 ## How to use it on llama.cpp server
+[Tutorial](https://github.com/BigStationW/Local-MCP-server/blob/main/docs/Use_on_llamacpp_server.md)
