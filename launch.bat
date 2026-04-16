@@ -69,7 +69,7 @@ echo ================================
 echo  MCP Server Starting...
 echo ================================
 echo.
-python mcp_server.py --port 4241
+python mcp_server.py --port 4242
 
 :: Deactivate virtual environment when done
 deactivate
