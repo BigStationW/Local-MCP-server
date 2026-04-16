@@ -18,7 +18,14 @@ git clone https://github.com/BigStationW/Local-MCP-server
 
 You're good to go, you can now grab its link: ```http://localhost:4242/mcp```
 
-<img width="400" height="287" alt="ete" src="https://github.com/user-attachments/assets/321f92fe-bf7e-404e-9346-dcd92c0aadb4" />
+<img width="400" alt="ete" src="https://github.com/user-attachments/assets/321f92fe-bf7e-404e-9346-dcd92c0aadb4" />
 
 ## How to use it on llama.cpp server
 [Tutorial](https://github.com/BigStationW/Local-MCP-server/blob/main/docs/Use_on_llamacpp_server.md)
+
+## How to use it on Sillytavern
+[Tutorial](https://github.com/BigStationW/Local-MCP-server/blob/main/docs/Use_on_sillytavern.md)
+
+## Example
+
+<img width="700" alt="ôuiooyuo" src="https://github.com/user-attachments/assets/5db9a985-2583-4d56-b85e-fced30132978" />
