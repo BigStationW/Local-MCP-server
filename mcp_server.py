@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
 import httpx
+from mcp.server.fastmcp.utilities.types import Image
 from mcp.server.fastmcp import FastMCP, Image
 from playwright.async_api import async_playwright
 from starlette.middleware.cors import CORSMiddleware
@@ -208,13 +209,13 @@ def normalize_image_bytes(data: bytes, source_fmt: str) -> tuple[bytes, str]:
         return data, source_fmt
 
 def save_screenshot(data: bytes, prefix: str = "screenshot") -> tuple[str, Image]:
-    """Save screenshot bytes to disk, return (public_url_string, Image_object)."""
     filename = f"{prefix}_{int(datetime.now().timestamp())}.png"
     filepath = SCREENSHOT_DIR / filename
     filepath.write_bytes(data)
-    url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
-    img = Image(data=data, format="png")
-    return url, img
+
+    public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
+
+    return public_url, Image(path=filepath)
 
 # ---------------------------------------------------------------------------
 # BASIC TOOLS
