@@ -368,15 +368,16 @@ async def puppeteer_session_find_images(
             fmt = mime.split("/")[-1].split(";")[0].strip() or "jpeg"
             if fmt not in ("png", "jpeg", "jpg", "gif", "webp"):
                 fmt = "jpeg"
-            filename = f"pageimg_{session_id}_{int(datetime.now().timestamp())}.{fmt}"
-            filepath = SCREENSHOT_DIR / filename
-            filepath.write_bytes(resp.content)
-            public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
+
             normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
+
             filename = f"pageimg_{session_id}_{int(datetime.now().timestamp())}.{normalized_fmt}"
             filepath = SCREENSHOT_DIR / filename
             filepath.write_bytes(normalized_data)
+
+            public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
             img_obj = Image(data=normalized_data, format=normalized_fmt)
+
             out.append(f"\n![{top['alt']}]({public_url})")
             out.append(img_obj)
         except Exception as e:
@@ -423,26 +424,24 @@ async def http_get_image(url: str, user_agent: str = None) -> list:
     headers = {
         "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    
+
     client = await get_http_client()
     try:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
-        
+
         mime_type = resp.headers.get("content-type", "image/jpeg")
         fmt = mime_type.split("/")[-1].split(";")[0] if "/" in mime_type else "jpeg"
 
-        filename = f"image_{int(datetime.now().timestamp())}.{fmt}"
-        filepath = SCREENSHOT_DIR / filename
-        filepath.write_bytes(resp.content)
-
-        public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
         normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
+
         filename = f"image_{int(datetime.now().timestamp())}.{normalized_fmt}"
         filepath = SCREENSHOT_DIR / filename
         filepath.write_bytes(normalized_data)
+
         public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
         img = Image(data=normalized_data, format=normalized_fmt)
+
         return [f"![image]({public_url})", img]
     except Exception as e:
         return [f"Error downloading image: {str(e)}"]
