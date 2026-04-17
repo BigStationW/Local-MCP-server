@@ -406,7 +406,7 @@ async def web_search_and_read(query: str, max_results: int = 5, read_top_n: int 
             if not it["url"]:
                 continue
             out.append(f"\n--- #{i}: {it['url']} ---")
-            out.append(await http_get_text(it["url"], article_only=True, max_chars=8000))
+            out.append(await http_get_text(it["url"], article_only=True, max_chars=5000))
 
         return "\n".join(out)
     except Exception as e:
@@ -418,9 +418,10 @@ async def http_get_text(
     user_agent: str = None,
     referer: str = None,
     article_only: bool = True,
-    max_chars: int = 8000,
+    max_chars: int = 5000,
 ) -> str:
     """Fetch a URL via HTTP GET and extract readable plain text.
+    Set max_chars to 0 for unlimited text length.
     Set article_only=True for main content extraction; use Playwright tools for JS-rendered sites."""
     headers = {
         "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -433,6 +434,10 @@ async def http_get_text(
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         text = parse_html_text(resp.text, article_only=article_only)
+        
+        # If max_chars is 0 or less, return everything. Otherwise, slice it.
+        if max_chars <= 0:
+            return text
         return text[:max_chars]
     except Exception as e:
         return f"Error fetching URL: {str(e)}"
@@ -634,20 +639,29 @@ async def puppeteer_session_navigate(
         return f"Navigation error: {str(e)}"
 
 @mcp.tool()
-async def puppeteer_session_get_page_text(session_id: str, extract_article_only: bool = False) -> str:
+async def puppeteer_session_get_page_text(
+    session_id: str, 
+    extract_article_only: bool = False,
+    max_chars: int = 5000
+) -> str:
     """Get the current page text from an existing session.
     
     Args:
         session_id: The session ID
         extract_article_only: Set to True to extract only main article content (strips nav/menus).
                               Default False returns all page text (better for forums/listings).
+        max_chars: Maximum characters to return. Set to 0 for unlimited.
     """
     page = browser_manager.sessions.get(session_id)
     if not page:
         return f"Error: No session found with session_id '{session_id}'."
     try:
         content = await page.content()
-        return parse_html_text(content, article_only=extract_article_only)
+        text = parse_html_text(content, article_only=extract_article_only)
+        
+        if max_chars <= 0:
+            return text
+        return text[:max_chars]
     except Exception as e:
         return f"Error getting page text: {str(e)}"
 
@@ -749,13 +763,16 @@ async def puppeteer_session_get_page_html(
     """
     Return the current fully-rendered HTML of the page (after JS has run).
     Use get_element_html with a narrow selector instead when possible —
-    this can be very large. Capped at max_chars characters.
+    this can be very large. Set max_chars to 0 for unlimited.
     """
     page = browser_manager.sessions.get(session_id)
     if not page:
         return f"Error: No session found with session_id '{session_id}'."
     try:
-        return (await page.content())[:max_chars]
+        content = await page.content()
+        if max_chars <= 0:
+            return content
+        return content[:max_chars]
     except Exception as e:
         return f"Error getting page HTML: {str(e)}"
 
