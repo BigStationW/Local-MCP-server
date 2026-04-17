@@ -279,10 +279,10 @@ async def image_search(query: str, max_results: int = 5) -> list:
                 public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
                 img = Image(data=normalized_data, format=normalized_fmt)
 
-                out.append(f'Result {downloaded + 1}: "{title}" — source: {source}')
-                out.append(f"Image URL: {public_url}")
+                out.append(f'Result {downloaded + 1}: "{title}" (source page: {source})')
+                out.append(f"Locally served image: {public_url}")
                 out.append(img)
-
+                
                 downloaded += 1
                 if downloaded >= max_results:
                     break
