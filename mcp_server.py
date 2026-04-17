@@ -212,9 +212,7 @@ def save_screenshot(data: bytes, prefix: str = "screenshot") -> tuple[str, Image
     filename = f"{prefix}_{int(datetime.now().timestamp())}.png"
     filepath = SCREENSHOT_DIR / filename
     filepath.write_bytes(data)
-
     public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
-
     return public_url, Image(data=data, format="png")
 
 # ---------------------------------------------------------------------------
@@ -456,7 +454,7 @@ async def http_get_image(url: str, user_agent: str = None) -> list:
         filepath.write_bytes(normalized_data)
         public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
         img = Image(data=normalized_data, format=normalized_fmt)
-        return [f"Image available at: {public_url}", img]
+        return [f"![image]({public_url})", img]
     except Exception as e:
         return [f"Error downloading image: {str(e)}"]
 
@@ -571,7 +569,7 @@ async def puppeteer_screenshot(
             await page.wait_for_selector(wait_for_selector, timeout=15000)
         data = await page.screenshot(full_page=True)
         public_url, img = save_screenshot(data)
-        return [f"Screenshot available at: {public_url}", img]
+        return [f"![screenshot]({public_url})", img]
     except Exception as e:
         return [f"Screenshot error: {str(e)}"]
     finally:
@@ -602,7 +600,7 @@ async def puppeteer_session_screenshot(session_id: str) -> list:
     try:
         data = await page.screenshot(full_page=True)
         public_url, img = save_screenshot(data, prefix=session_id)
-        return [f"Screenshot available at: {public_url}", img]
+        return [f"![screenshot]({public_url})", img]
     except Exception as e:
         return [f"Screenshot error: {str(e)}"]
 
