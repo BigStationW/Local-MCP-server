@@ -381,36 +381,6 @@ async def puppeteer_session_find_images(
 
     except Exception as e:
         return [f"Error extracting images: {str(e)}"]
-    
-@mcp.tool()
-async def web_search_and_read(query: str, max_results: int = 5, read_top_n: int = 2) -> str:
-    """Search the web (DuckDuckGo) and then fetch/extract full text from the top N results.
-    Use this when snippets aren't enough. May miss content on JavaScript-heavy pages."""
-    try:
-        items = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                items.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", "")
-                })
-
-        out = []
-        out.append("=== Search results ===")
-        for i, it in enumerate(items, 1):
-            out.append(f"{i}. {it['title']}\n   {it['url']}\n   {it['snippet']}\n")
-
-        out.append("\n=== Full text from top results ===")
-        for i, it in enumerate(items[:read_top_n], 1):
-            if not it["url"]:
-                continue
-            out.append(f"\n--- #{i}: {it['url']} ---")
-            out.append(await http_get_text(it["url"], article_only=True, max_chars=5000))
-
-        return "\n".join(out)
-    except Exception as e:
-        return f"Search/read error: {str(e)}"
 
 @mcp.tool()
 async def http_get_text(
