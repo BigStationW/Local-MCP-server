@@ -21,6 +21,8 @@ from ddgs import DDGS
 from readability import Document
 from markdownify import markdownify as md
 import re
+import atexit
+import signal
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -164,24 +166,27 @@ class BrowserManager:
 browser_manager = BrowserManager()
 
 def parse_html_text(html_content: str, article_only: bool = True) -> str:
-    """Convert HTML to clean markdown, preserving links and structure."""
     if article_only:
-        try:
-            doc = Document(html_content)
-            html_to_parse = doc.summary()
-        except Exception:
-            html_to_parse = html_content
-    else:
+        result = trafilatura.extract(
+            html_content,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            no_fallback=False,
+        )
+        if result:
+            return result.strip()
+        # Fallback to readability+markdownify if trafilatura returns nothing
+    
+    # For article_only=False, or when trafilatura fails
+    try:
+        doc = Document(html_content)
+        html_to_parse = doc.summary() if article_only else html_content
+    except Exception:
         html_to_parse = html_content
 
-    # Convert to markdown
-    text = md(
-        html_to_parse,
-        heading_style="ATX",
-        strip=["img", "script", "style", "nav", "footer", "header"]
-    )
-    
-    # Clean up excessive whitespace
+    text = md(html_to_parse, heading_style="ATX",
+              strip=["img", "script", "style", "nav", "footer", "header"])
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[^\S\n]+", " ", text)
     return text.strip()
@@ -749,10 +754,20 @@ async def puppeteer_session_get_page_html(
 # ---------------------------------------------------------------------------
 # SERVER RUNNER
 # ---------------------------------------------------------------------------
-async def shutdown():
-    """Cleanup on shutdown."""
-    await browser_manager.cleanup()
-    await cleanup_http_client()
+def sync_cleanup():
+    """Synchronous cleanup for atexit/signal handlers."""
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(asyncio.wait_for(browser_manager.cleanup(), timeout=3.0))
+    except Exception:
+        pass
+    finally:
+        loop.close()
+
+atexit.register(sync_cleanup)
+
+# Also handle SIGTERM explicitly (what the X button sends)
+signal.signal(signal.SIGTERM, lambda *_: sync_cleanup())
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Web Tools MCP Server")
