@@ -9,7 +9,7 @@ This repository gives any tool-calling LLM (such as Gemma 4 or Qwen 3.5) the abi
 
 ## Installation
 
-1) Navigate to the **ComfyUI/custom_nodes** folder, [open cmd](https://www.youtube.com/watch?v=bgSSJQolR0E&t=47s) and run:
+1) [Open cmd](https://www.youtube.com/watch?v=bgSSJQolR0E&t=47s) and run:
 
 ```
 git clone https://github.com/BigStationW/Local-MCP-server
