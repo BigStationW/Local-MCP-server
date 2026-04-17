@@ -8,7 +8,6 @@ import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
-from bs4 import BeautifulSoup
 import httpx
 from mcp.server.fastmcp.utilities.types import Image
 from mcp.server.fastmcp import FastMCP, Image
@@ -19,6 +18,9 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 import trafilatura
 from ddgs import DDGS
+from readability import Document
+from markdownify import markdownify as md
+import re
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -161,21 +163,28 @@ class BrowserManager:
 
 browser_manager = BrowserManager()
 
-def parse_html_text(html_content: str, article_only: bool = False) -> str:
+def parse_html_text(html_content: str, article_only: bool = True) -> str:
+    """Convert HTML to clean markdown, preserving links and structure."""
     if article_only:
-        result = trafilatura.extract(
-            html_content,
-            include_comments=False,
-            include_tables=True,
-            include_links=True,
-        )
-        if result:
-            return result
-    # Default: BeautifulSoup full text
-    soup = BeautifulSoup(html_content, "html.parser")
-    for tag in soup(["script", "style"]):
-        tag.extract()
-    return soup.get_text(separator="\n", strip=True) or ""
+        try:
+            doc = Document(html_content)
+            html_to_parse = doc.summary()
+        except Exception:
+            html_to_parse = html_content
+    else:
+        html_to_parse = html_content
+
+    # Convert to markdown
+    text = md(
+        html_to_parse,
+        heading_style="ATX",
+        strip=["img", "script", "style", "nav", "footer", "header"]
+    )
+    
+    # Clean up excessive whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[^\S\n]+", " ", text)
+    return text.strip()
 
 def normalize_image_bytes(data: bytes, source_fmt: str) -> tuple[bytes, str]:
     """
@@ -624,7 +633,6 @@ async def puppeteer_session_navigate(
     except Exception as e:
         return f"Navigation error: {str(e)}"
 
-# Swap the default — BeautifulSoup as default, trafilatura as opt-in
 @mcp.tool()
 async def puppeteer_session_get_page_text(session_id: str, extract_article_only: bool = False) -> str:
     """Get the current page text from an existing session.
