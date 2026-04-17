@@ -280,7 +280,7 @@ async def image_search(query: str, max_results: int = 5) -> list:
                 img = Image(data=normalized_data, format=normalized_fmt)
 
                 out.append(f'Result {downloaded + 1}: "{title}" (source page: {source})')
-                out.append(f"Locally served image: {public_url}")
+                out.append(f"![{title}]({public_url})")
                 out.append(img)
                 
                 downloaded += 1
@@ -363,7 +363,7 @@ async def puppeteer_session_find_images(
             filepath = SCREENSHOT_DIR / filename
             filepath.write_bytes(normalized_data)
             img_obj = Image(data=normalized_data, format=normalized_fmt)
-            out.append(f"\nLargest image downloaded: {public_url}")
+            out.append(f"\n![{top['alt']}]({public_url})")
             out.append(img_obj)
         except Exception as e:
             out.append(f"\nCould not auto-download largest image: {e}")
