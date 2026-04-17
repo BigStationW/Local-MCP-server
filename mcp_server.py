@@ -266,6 +266,7 @@ async def image_search(query: str, max_results: int = 5) -> list:
         client = await get_http_client()
         out = []
         downloaded = 0
+        batch_ts = int(datetime.now().timestamp()) 
 
         for hit in hits:
             image_url = hit.get("image", "")
@@ -286,7 +287,7 @@ async def image_search(query: str, max_results: int = 5) -> list:
                     fmt = "jpeg"
 
                 normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
-                filename = f"imgsearch_{int(datetime.now().timestamp())}_{downloaded}.{normalized_fmt}"
+                filename = f"imgsearch_{batch_ts}_{downloaded}.{normalized_fmt}"
                 filepath = SCREENSHOT_DIR / filename
                 filepath.write_bytes(normalized_data)
 
@@ -334,6 +335,7 @@ async def puppeteer_session_find_images(
         return [f"Error: No session found with session_id '{session_id}'."]
 
     try:
+        batch_ts = int(datetime.now().timestamp())
         images = await page.evaluate(f"""
             () => {{
                 const imgs = Array.from(document.querySelectorAll('img'));
@@ -371,7 +373,7 @@ async def puppeteer_session_find_images(
 
             normalized_data, normalized_fmt = normalize_image_bytes(resp.content, fmt)
 
-            filename = f"pageimg_{session_id}_{int(datetime.now().timestamp())}.{normalized_fmt}"
+            filename = f"pageimg_{session_id}_{batch_ts}.{normalized_fmt}"
             filepath = SCREENSHOT_DIR / filename
             filepath.write_bytes(normalized_data)
 
