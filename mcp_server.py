@@ -215,7 +215,7 @@ def save_screenshot(data: bytes, prefix: str = "screenshot") -> tuple[str, Image
 
     public_url = f"http://localhost:{SERVER_PORT}/screenshots/{filename}"
 
-    return public_url, Image(path=filepath)
+    return public_url, Image(data=data, format="png")
 
 # ---------------------------------------------------------------------------
 # BASIC TOOLS
