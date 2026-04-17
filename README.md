@@ -1,7 +1,7 @@
 # Local-MCP-server
 
 ## Use case
-This repository allows your LLM (such as Gemma 4 or Qwen 3.5) to use tools such as:
+This repository gives any tool-calling LLM (such as Gemma 4 or Qwen 3.5) the ability to:
 - Search the internet
 - Capture images of websites
 - Extract readable text from web pages
