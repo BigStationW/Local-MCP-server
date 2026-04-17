@@ -27,4 +27,5 @@ You're good to go, you can now grab its link: ```http://localhost:4242/mcp```
 
 ## Example
 
-<img width="700" alt="ôuiooyuo" src="https://github.com/user-attachments/assets/5db9a985-2583-4d56-b85e-fced30132978" />
+<img width="700" alt="image" src="https://github.com/user-attachments/assets/10fc6623-b08f-4267-9b89-0ef905f23df0" />
+
