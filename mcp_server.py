@@ -768,24 +768,19 @@ if __name__ == "__main__":
         help="Port to run the server on (default: 4242)"
     )
     args = parser.parse_args()
-
-    # Set the global port so save_screenshot / http_get_image use it
+    
+    # Set the global port
     SERVER_PORT = args.port
     mcp.settings.port = args.port
-
-    # --- Disable colors in Uvicorn's default config dict ---
+    
+    # Disable colors in Uvicorn
     import uvicorn
     if "default" in uvicorn.config.LOGGING_CONFIG["formatters"]:
         uvicorn.config.LOGGING_CONFIG["formatters"]["default"]["use_colors"] = False
     if "access" in uvicorn.config.LOGGING_CONFIG["formatters"]:
         uvicorn.config.LOGGING_CONFIG["formatters"]["access"]["use_colors"] = False
-
-    print(f"Web Tools MCP Server is running!")
-    print(f"Connect your AI client at:  http://localhost:{SERVER_PORT}/mcp")
     
-    try:
-        mcp.run(transport="streamable-http")
-    finally:
-        # Cleanup on exit
-        import asyncio
-        asyncio.run(shutdown())
+    print(f"Web Tools MCP Server is running!")
+    print(f"Connect your AI client at: http://localhost:{SERVER_PORT}/mcp")
+    
+    mcp.run(transport="streamable-http")
