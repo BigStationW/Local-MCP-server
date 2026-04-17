@@ -14,7 +14,7 @@ On the bottom of the file, change ```enableServerPlugins: false``` to ```enableS
 <img width="300" alt="image" src="https://github.com/user-attachments/assets/8e0ac24b-83df-4d7a-a01b-93ca2d597f27" />
 
 - Run SillyTavern and go to its frontend web page
-- Go to **API Connections** -> **Chat completion**
+- Go to **API Connections** -> **API** -> choose **Chat completion**
 
  <img width="300" alt="image" src="https://github.com/user-attachments/assets/a7a96d53-6879-4c02-bb34-a8e344ff11f9" />
  
