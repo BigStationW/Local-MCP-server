@@ -243,18 +243,29 @@ _GUTENBERG_END_MARKERS = [
     "End of Project Gutenberg",
 ]
  
+_GUTENBERG_START_MARKERS = [
+    "*** START OF THIS PROJECT GUTENBERG",
+    "*** START OF THE PROJECT GUTENBERG",
+    "*END*THE SMALL PRINT!",
+    "***START OF THE PROJECT GUTENBERG",
+]
+
 def _strip_gutenberg(text: str) -> str:
-    """
-    Truncate text at the earliest Gutenberg end-marker found.
-    Always call this before slicing, counting, or indexing book content.
-    """
-    indices = []
-    for marker in _GUTENBERG_END_MARKERS:
-        idx = text.find(marker)
-        if idx != -1:
-            indices.append(idx)
-    if indices:
-        text = text[:min(indices)]
+    # Fix 1: Strip BOM
+    text = text.lstrip('\ufeff')
+
+    # 1. Strip the end
+    end_indices = [text.find(m) for m in _GUTENBERG_END_MARKERS if text.find(m) != -1]
+    if end_indices:
+        text = text[:min(end_indices)]
+
+    # 2. Strip the start
+    start_indices = [text.find(m) for m in _GUTENBERG_START_MARKERS if text.find(m) != -1]
+    if start_indices:
+        start_idx = min(start_indices)
+        eol = text.find('\n', start_idx)
+        text = text[eol + 1:] if eol != -1 else text[start_idx:]
+
     return text.strip()
  
 def _manticore_conn():
@@ -300,20 +311,37 @@ async def gutenberg_index_stats(language: str = "") -> str:
     Returns: Total paragraph count by language, list of indexed books, and a tip.
     """
     lang_clause = f"AND language='{language[:5].replace(chr(39), '')}'" if language else ""
- 
+
+    # --- Filesystem book count (always available, regardless of index state) ---
+    books_dir = os.path.join(os.path.dirname(__file__), "gutenberg", "books", "txt")
+    pattern = r"^(.+?) - (.+?) \((\w{2})\)\.txt$"
+    disk_books = []
+    if os.path.exists(books_dir):
+        for f in os.listdir(books_dir):
+            m = re.match(pattern, f)
+            if m:
+                _, _, lang = m.groups()
+                disk_books.append(f)
+
     sql_total = f"SELECT COUNT(*) AS cnt FROM gutenberg_paragraphs WHERE 1=1 {lang_clause}"
     sql_langs = "SELECT language, COUNT(*) AS cnt FROM gutenberg_paragraphs GROUP BY language ORDER BY cnt DESC"
-    # GROUP BY instead of DISTINCT — Manticore does not support SELECT DISTINCT
     sql_books = (
         f"SELECT book_id, title, author FROM gutenberg_paragraphs "
         f"WHERE 1=1 {lang_clause} GROUP BY book_id LIMIT 50"
     )
+    sql_global_total = "SELECT COUNT(*) AS cnt FROM gutenberg_paragraphs"
+    sql_lang_total = f"SELECT COUNT(*) AS cnt FROM gutenberg_paragraphs WHERE 1=1 {lang_clause}"
  
     try:
         conn = _manticore_conn()
         cur = conn.cursor(_pymysql.cursors.DictCursor)
  
-        cur.execute(sql_total)
+        # Check global index first
+        cur.execute(sql_global_total)
+        global_total = cur.fetchone()["cnt"]
+
+        # Then filtered total
+        cur.execute(sql_lang_total)
         total = cur.fetchone()["cnt"]
  
         cur.execute(sql_langs)
@@ -327,18 +355,21 @@ async def gutenberg_index_stats(language: str = "") -> str:
     except _pymysql.OperationalError as e:
         return (
             f"❌ Cannot connect to Manticore Search: {e}\n"
+            f"Books on disk: {len(disk_books):,}\n"
             "Fix: Win+R → services.msc → ManticoreSearch → Start"
         )
     except Exception as e:
         return f"Manticore query error: {type(e).__name__}: {e}"
  
     lines = ["=== Gutenberg Index Stats ===\n"]
+    lines.append(f"Books on disk: {len(disk_books):,}")
     lines.append(f"Total paragraphs indexed: {total:,}")
  
-    if total == 0:
+    if global_total == 0:
         lines.append(
-            "\n⚠️  Index is empty — no searches will return results.\n"
-            "Run your indexing pipeline before using gutenberg_prose_search."
+            "\n⚠️  Search index is entirely empty — no paragraphs indexed.\n"
+            f"However, {len(disk_books):,} book(s) are available on disk.\n"
+            "Run your indexing pipeline to enable full-text search."
         )
         return "\n".join(lines)
  
@@ -531,7 +562,7 @@ async def list_available_books(
  
     # book_id filter: scan each candidate file's header for the Gutenberg etext number
     if book_id != -1:
-        id_pattern = re.compile(rf"\[(?:E[Tt]ext|[Ee]Book)[^\d]*{book_id}\b")
+        id_pattern = re.compile(rf"(?:E[Tt]ext|[Ee]Book)[^\d]*{book_id}\b", re.IGNORECASE)
         matched = []
         for book in books:
             fpath = os.path.join(books_dir, book["filename"])
