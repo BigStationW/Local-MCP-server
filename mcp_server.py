@@ -340,7 +340,52 @@ def _strip_gutenberg(text: str) -> tuple[str, int]:
 
     return text, strip_offset
 
+def _extract_centered_snippet(body: str, query_words: list[str], budget: int = 400) -> str:
+    body = body.strip()
+    if not body:
+        return ""
 
+    match_pos = len(body)
+    for word in query_words:
+        idx = body.lower().find(word.lower())
+        if idx != -1 and idx < match_pos:
+            match_pos = idx
+
+    half = budget // 2
+    if match_pos <= half:
+        start = 0
+    else:
+        lookback = body[max(0, match_pos - half): match_pos]
+        last_sent_end = None
+        for m in re.finditer(r'[.!?][\u201d\u2019"\']?\s+', lookback):
+            last_sent_end = m
+        if last_sent_end:
+            start = (match_pos - half) + last_sent_end.end()
+        else:
+            last_para = lookback.rfind('\n\n')
+            if last_para != -1:
+                start = (match_pos - half) + last_para + 2
+            else:
+                last_space = lookback.rfind(' ')
+                start = (match_pos - half) + (last_space + 1 if last_space != -1 else 0)
+
+    chunk = body[start: start + budget]
+
+    last_end = None
+    for m in re.finditer(r'[.!?][\u201d\u2019"\']?(?=\s|$)', chunk):
+        last_end = m
+
+    if last_end:
+        return chunk[:last_end.end()].strip()
+
+    extended = body[start: start + budget + 300]
+    last_end = None
+    for m in re.finditer(r'[.!?][\u201d\u2019"\']?(?=\s|$)', extended):
+        last_end = m
+    if last_end:
+        return extended[:last_end.end()].strip()
+
+    return chunk.strip()
  
 def _manticore_conn():
     return _pymysql.connect(
@@ -565,61 +610,25 @@ async def gutenberg_prose_search(
     for i, row in enumerate(rows, 1):
         body = (row.get("body") or "").strip()
 
-        first_real = re.search(r'[^\s\u201c\u2018"\']', body)
-        if first_real and body[first_real.start()].islower():
-            # Pass 1: strict — sentence end followed by uppercase or opening quote
-            m = re.search(
-                r'[.!?][\u201d\u2019"\']?\s+(?=[A-Z\u201c\u2018"\'])',
-                body[:400],
-            )
-            # Pass 2
-            if not m:
-                m = re.search(
-                    r'[!?][\u201d\u2019"\']?\s+(?=\w)',
-                    body[:400],
-                )
-            if m:
-                body = body[m.end():]
+        snippet = _extract_centered_snippet(body, words, budget=400)
 
-        BUDGET = 500
-        chunk = body[:BUDGET]
-
-        # Walk forward collecting every sentence-end position; keep the last one
-        # that still fits inside BUDGET so we get a full, clean closing sentence.
-        last_end = None
-        for m in re.finditer(r'[.!?][\u201d\u2019"\']?(?=\s|$)', chunk):
-            last_end = m
-
-        if last_end:
-            snippet = chunk[: last_end.end()].strip()
-        else:
-            # Nothing ended inside the budget – extend a little further to find one.
-            extended = body[: BUDGET + 300]
-            last_end = None
-            for m in re.finditer(r'[.!?][\u201d\u2019"\']?(?=\s|$)', extended):
-                last_end = m
-            snippet = (extended[: last_end.end()].strip() if last_end else chunk.strip())
-        
-        # Try to get exact filename from catalog
         filename = _GUTENBERG_CATALOG.get(row['book_id'])
-        
+
         if filename:
-            # Direct path - catalog available
             lines.append(
                 f"{i}. {row['title']} by {row['author']}\n"
                 f"   book_id: {row['book_id']} | start_char: {row['start_char']}\n"
                 f"   filename: {filename}\n"
-                f"   Match: ...{snippet[:500]}...\n"
+                f"   Match: {snippet}\n"
             )
         else:
-            # Fallback path - no catalog or book not found
             lines.append(
                 f"{i}. {row['title']} by {row['author']}\n"
                 f"   book_id: {row['book_id']} | start_char: {row['start_char']}\n"
                 f"   (Use list_available_books(book_id={row['book_id']}) to get filename)\n"
-                f"   Match: ...{snippet[:500]}...\n"
+                f"   Match: {snippet}\n"
             )
- 
+
     if _GUTENBERG_CATALOG:
         lines.append(
             "\nNext step:\n"
