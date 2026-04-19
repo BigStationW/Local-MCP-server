@@ -50,7 +50,7 @@ def _load_gutenberg_catalog():
     )
     
     if not os.path.exists(catalog_path):
-        logging.debug("Gutenberg catalog not found - filename lookups will use list_available_books")
+        logging.debug("Gutenberg catalog not found")
         return
     
     try:
@@ -413,128 +413,41 @@ def date_time() -> str:
 # ---------------------------------------------------------------------------
 # LOCAL BOOK RETRIEVAL
 # ----------------------------------------------------------------------------
-
-@mcp.tool()
-async def gutenberg_index_stats(language: str = "") -> str:
-    """
-    Return counts and book list from the Gutenberg full-text index.
- 
-    Call this BEFORE gutenberg_prose_search when:
-    - You are unsure whether any books have been indexed.
-    - Multiple searches return zero results and you suspect a connection/index issue.
-    - You want to know which languages are available.
- 
-    Args:
-        language: Optional two-letter code (e.g. "en", "fr"). Leave blank for all.
- 
-    Returns: Total paragraph count by language, list of indexed books, and a tip.
-    """
-    lang_clause = f"AND language='{language[:5].replace(chr(39), '')}'" if language else ""
-
-    # --- Filesystem book count (always available, regardless of index state) ---
-    books_dir = os.path.join(os.path.dirname(__file__), "gutenberg", "books", "txt")
-    pattern = r"^(.+?) - (.+?) \((\w{2})\)\.txt$"
-    disk_books = []
-    if os.path.exists(books_dir):
-        for f in os.listdir(books_dir):
-            m = re.match(pattern, f)
-            if m:
-                _, _, lang = m.groups()
-                disk_books.append(f)
-
-    sql_total = f"SELECT COUNT(*) AS cnt FROM gutenberg_paragraphs WHERE 1=1 {lang_clause}"
-    sql_langs = "SELECT language, COUNT(*) AS cnt FROM gutenberg_paragraphs GROUP BY language ORDER BY cnt DESC"
-    sql_books = (
-        f"SELECT book_id, title, author FROM gutenberg_paragraphs "
-        f"WHERE 1=1 {lang_clause} GROUP BY book_id LIMIT 50"
-    )
-    sql_global_total = "SELECT COUNT(*) AS cnt FROM gutenberg_paragraphs"
-    sql_lang_total = f"SELECT COUNT(*) AS cnt FROM gutenberg_paragraphs WHERE 1=1 {lang_clause}"
- 
-    try:
-        conn = _manticore_conn()
-        cur = conn.cursor(_pymysql.cursors.DictCursor)
- 
-        # Check global index first
-        cur.execute(sql_global_total)
-        global_total = cur.fetchone()["cnt"]
-
-        # Then filtered total
-        cur.execute(sql_lang_total)
-        total = cur.fetchone()["cnt"]
- 
-        cur.execute(sql_langs)
-        by_lang = cur.fetchall()
- 
-        cur.execute(sql_books)
-        books = cur.fetchall()
- 
-        conn.close()
- 
-    except _pymysql.OperationalError as e:
-        return (
-            f"❌ Cannot connect to Manticore Search: {e}\n"
-            f"Books on disk: {len(disk_books):,}\n"
-            "Fix: Win+R → services.msc → ManticoreSearch → Start"
-        )
-    except Exception as e:
-        return f"Manticore query error: {type(e).__name__}: {e}"
- 
-    lines = ["=== Gutenberg Index Stats ===\n"]
-    lines.append(f"Books on disk: {len(disk_books):,}")
-    lines.append(f"Total paragraphs indexed: {total:,}")
- 
-    if global_total == 0:
-        lines.append(
-            "\n⚠️  Search index is entirely empty — no paragraphs indexed.\n"
-            f"However, {len(disk_books):,} book(s) are available on disk.\n"
-            "Run your indexing pipeline to enable full-text search."
-        )
-        return "\n".join(lines)
- 
-    lines.append("\nParagraphs by language:")
-    for row in by_lang:
-        lines.append(f"  {row['language']}: {row['cnt']:,}")
- 
-    label = f" (language={language})" if language else ""
-    lines.append(f"\nIndexed books{label}:")
-    for b in books:
-        lines.append(f"  [{b['book_id']}] {b['title']} — {b['author']}")
- 
-    lines.append(
-        "\nTip: Use 2-4 words that would plausibly appear near each other "
-        "in the middle of a sentence in these books.\n"
-        "Tip: Pass a book_id from these results to list_available_books(book_id=...) "
-        "to get the exact filename for read_book_content."
-    )
-    return "\n".join(lines)
  
 @mcp.tool()
 async def gutenberg_prose_search(
     query: str,
     language: str = "en",
-    max_results: int = 5,
+    max_results: int = 10,
+    offset: int = 0,
     proximity: int = 50,
 ) -> str:
     """
     Search the full prose text of all indexed Gutenberg books by concrete word clusters.
     Returns highlighted paragraphs with book IDs, filenames, and start_char offsets
     ready to pass directly to read_book_content.
- 
+
+    Results are ranked by proximity_bm25: a combined score of
+      • BM25  — rewards rare words that appear frequently in the paragraph
+      • Proximity — rewards paragraphs where the query words sit close together
+    Body text is weighted 10× higher than title text.
+    The first result is therefore the strongest match; quality degrades toward the end.
+
     Args:
         query:       2-4 concrete words likely to appear near each other in prose.
                      Use mid-sentence fragments, NOT abstract mood words.
                      Good: "lamp brass shadow table" / "heart beat silence"
                      Bad:  "dark atmospheric sensual"
         language:    Two-letter code. Default "en".
-        max_results: Paragraphs to return (default 5).
+        max_results: Number of paragraphs to return per page (default 10).
+        offset:      Zero-based index of the first result to return (default 0).
+                     Use offset=10 to get results 11-20, offset=20 for 21-30, etc.
         proximity:   Max token distance between query words (default 50).
                      Increase to 100-200 if zero results with valid words.
- 
+
     Workflow:
-        gutenberg_index_stats()                    ← if unsure about the index
-        gutenberg_prose_search(query="...")        ← find passages
-        list_available_books(book_id=<id>)         ← resolve ID to filename
+        gutenberg_prose_search(query="...")                          ← first page
+        gutenberg_prose_search(query="...", offset=10)              ← next page
         read_book_content(filename=..., start_char=...)
     """
     clean_query = re.sub(r'[^\w\s]', '', query)
@@ -550,7 +463,7 @@ async def gutenberg_prose_search(
             "SELECT book_id, title, author, language, start_char, body "
             "FROM gutenberg_paragraphs "
             f"WHERE MATCH('{fts_safe}') AND language='{lang_safe}' "
-            f"LIMIT {int(max_results)} "
+            f"LIMIT {int(offset)}, {int(max_results)} "
             "OPTION ranker=proximity_bm25, field_weights=(body=10,title=1)"
         )
  
@@ -566,11 +479,17 @@ async def gutenberg_prose_search(
  
         cur.execute(_make_sql(proximity_fts))
         rows = cur.fetchall()
+        cur.execute("SHOW META")
+        meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
+        total_found = int(meta.get("total_found", len(rows)))
         used_fallback = False
  
         if not rows and len(words) > 1:
             cur.execute(_make_sql(fallback_fts))
             rows = cur.fetchall()
+            cur.execute("SHOW META")
+            meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
+            total_found = int(meta.get("total_found", len(rows)))
             used_fallback = True
  
         conn.close()
@@ -578,8 +497,7 @@ async def gutenberg_prose_search(
     except _pymysql.OperationalError as e:
         return (
             f"❌ Cannot connect to Manticore Search: {e}\n"
-            "Fix: Win+R → services.msc → ManticoreSearch → Start\n"
-            "Call gutenberg_index_stats() to confirm the service is up."
+            "Fix: Win+R → services.msc → ManticoreSearch → Start"
         )
     except Exception as e:
         return f"Manticore query error: {type(e).__name__}: {e}"
@@ -588,11 +506,10 @@ async def gutenberg_prose_search(
         return (
             f"No prose matches for '{query}' (language={language}, proximity={proximity}).\n\n"
             "Diagnosis:\n"
-            "  1. Call gutenberg_index_stats() to confirm the index is non-empty.\n"
-            "  2. Try fewer words — 2 is often better than 4.\n"
-            "  3. Increase proximity= to 150 or 200.\n"
-            "  4. Use words from the middle of sentences, not headings or dialogue tags.\n"
-            f"  5. Confirm language='{language}' is indexed."
+            "  1. Try fewer words — 2 is often better than 4.\n"
+            "  2. Increase proximity= to 150 or 200.\n"
+            "  3. Use words from the middle of sentences, not headings or dialogue tags.\n"
+            f"  4. Confirm language='{language}' is indexed."
         )
  
     fallback_note = (
@@ -602,11 +519,14 @@ async def gutenberg_prose_search(
         if used_fallback else ""
     )
  
+    first = offset + 1
+    last  = offset + len(rows)
     lines = [
-        f"Found {len(rows)} prose match(es) for '{query}' "
-        f"(language={language}, proximity={proximity}):{fallback_note}\n"
+        f"Found {total_found} prose match(es) for '{query}' "
+        f"(language={language}, proximity={proximity}) — displaying {first}–{last}:"
+        f"{fallback_note}\n"
     ]
- 
+
     for i, row in enumerate(rows, 1):
         body = (row.get("body") or "").strip()
 
@@ -625,228 +545,34 @@ async def gutenberg_prose_search(
             lines.append(
                 f"{i}. {row['title']} by {row['author']}\n"
                 f"   book_id: {row['book_id']} | start_char: {row['start_char']}\n"
-                f"   (Use list_available_books(book_id={row['book_id']}) to get filename)\n"
                 f"   Match: {snippet}\n"
             )
 
-    if _GUTENBERG_CATALOG:
-        lines.append(
-            "\nNext step:\n"
-            "  • read_book_content(filename=<filename>, start_char=<start_char>)"
-        )
-    else:
-        lines.append(
-            "\nNext steps:\n"
-            "  1. list_available_books(book_id=<book_id>) to get exact filename\n"
-            "  2. read_book_content(filename=<filename>, start_char=<start_char>)"
-        )
-    return "\n".join(lines)
- 
-@mcp.tool()
-async def list_available_books(
-    author_filter: str = "",
-    language: str = "",
-    book_id: int = -1,
-) -> str:
-    """
-    List all Gutenberg books available in the local txt directory.
- 
-    Args:
-        author_filter: Substring to filter by author name (case-insensitive).
-        language:      Two-letter language code, e.g. "en" or "fr".
-        book_id:       Gutenberg book ID from gutenberg_prose_search or gutenberg_index_stats.
-                       When provided, scans file headers and returns ONLY the book whose
-                       Gutenberg ID matches — use this to get an exact filename before
-                       calling read_book_content or get_book_stats.
- 
-    Returns: Book list with exact filenames.
- 
-    Typical use after a search:
-        gutenberg_prose_search → book_id: 1898
-        list_available_books(book_id=1898) → filename: "Honore de Balzac - Albert Savarus (en).txt"
-        read_book_content(filename=..., start_char=...)
-    """
-    books_dir = os.path.join(os.path.dirname(__file__), "gutenberg", "books", "txt")
- 
-    if not os.path.exists(books_dir):
-        return f"Books directory not found: {books_dir}"
- 
-    txt_files = [f for f in os.listdir(books_dir) if f.endswith(".txt")]
-    if not txt_files:
-        return "No books found in the directory."
- 
-    pattern = r"^(.+?) - (.+?) \((\w{2})\)\.txt$"
-    books = []
- 
-    for filename in txt_files:
-        m = re.match(pattern, filename)
-        if not m:
-            continue
-        author, title, lang = m.groups()
-        if author_filter and author_filter.lower() not in author.lower():
-            continue
-        if language and lang != language:
-            continue
-        books.append({"filename": filename, "author": author, "title": title, "language": lang})
- 
-    # book_id filter: scan each candidate file's header for the Gutenberg etext number
-    if book_id != -1:
-        matched = []
+        next_offset = offset + len(rows)
+        prev_offset = max(0, offset - max_results)
 
-        # Fast path: use the pre-loaded catalog dict if available
-        if _GUTENBERG_CATALOG:
-            catalog_filename = _GUTENBERG_CATALOG.get(book_id)
-            if catalog_filename:
-                matched = [b for b in books if b["filename"] == catalog_filename]
-
-        # Slow path: scan file headers (fallback if catalog missing or no match)
-        if not matched:
-            id_pattern = re.compile(rf"(?:E[Tt]ext|[Ee]Book)[^\d]*{book_id}\b", re.IGNORECASE)
-            for book in books:
-                fpath = os.path.join(books_dir, book["filename"])
-                try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        header = f.read(1500)
-                    if id_pattern.search(header):
-                        matched.append(book)
-                except Exception:
-                    continue
-
-        if not matched:
-            return (
-                f"No book found with book_id={book_id}.\n"
-                "The ID comes from gutenberg_prose_search or gutenberg_index_stats.\n"
-                "If you're certain the book is in the library, call list_available_books() "
-                "without a book_id to see all available filenames."
+        next_steps = ["\nNext steps:"]
+        if next_offset < total_found:
+            next_steps.append(
+                f"  • Continue  → gutenberg_prose_search(query='{query}', offset={next_offset}, max_results={max_results})"
             )
-        books = matched
- 
-    if not books:
-        filters = []
-        if author_filter:
-            filters.append(f"author containing '{author_filter}'")
-        if language:
-            filters.append(f"language='{language}'")
-        if book_id != -1:
-            filters.append(f"book_id={book_id}")
-        return f"No books found matching {' and '.join(filters)}."
- 
-    books.sort(key=lambda x: (x["author"], x["title"]))
- 
-    lines = [f"Found {len(books)} book(s):\n"]
-    for i, book in enumerate(books, 1):
-        lines.append(f"{i}. {book['title']} by {book['author']} ({book['language']})")
-        lines.append(f"   Filename: {book['filename']}\n")
- 
+        if offset > 0:
+            next_steps.append(
+                f"  • Go back   → gutenberg_prose_search(query='{query}', offset={prev_offset}, max_results={max_results})"
+            )
+        if _GUTENBERG_CATALOG:
+            next_steps.append(
+                "  • Read text → read_book_content(filename=<filename>, start_char=<start_char>)"
+            )
+        else:
+            next_steps.append(
+                "  • Read text → read_book_content(filename=<filename>, start_char=<start_char>)"
+            )
+        next_steps.append(
+            f"  Total found: {total_found} | Currently showing: {first}–{last}"
+        )
+        lines.append("\n".join(next_steps))
     return "\n".join(lines)
-
-@mcp.tool()
-async def get_book_stats(filename: str) -> str:
-    """
-    Get metadata, statistics, and chapter offsets for a specific book.
- 
-    Character counts and chapter offsets reflect story content only —
-    Gutenberg boilerplate and license text are automatically excluded.
- 
-    Args:
-        filename: Exact filename from list_available_books,
-                  e.g., "Honore de Balzac - Albert Savarus (en).txt"
- 
-    Returns:
-        Metadata, character/word/line counts, reading time, 500-char preview,
-        and a table of chapter offsets for use with read_book_content.
-    """
-    books_dir = os.path.join(os.path.dirname(__file__), "gutenberg", "books", "txt")
-    filepath = os.path.join(books_dir, filename)
- 
-    if not os.path.exists(filepath):
-        return f"Book not found: {filename}\nUse list_available_books() to see available books."
- 
-    pat = r"^(.+?) - (.+?) \((\w{2})\)\.txt$"
-    m = re.match(pat, filename)
-    author, title, lang = m.groups() if m else ("Unknown", "Unknown", "??")
- 
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            raw = f.read()
-    except Exception as e:
-        return f"Error reading book: {type(e).__name__}: {e}"
- 
-    # Strip boilerplate FIRST so all stats reflect story content only
-    content, strip_offset = _strip_gutenberg(raw)
- 
-    char_count  = len(content)
- 
-    char_count  = len(content)
-    word_count  = len(content.split())
-    line_count  = content.count("\n") + 1
-    reading_min = word_count / 250
- 
-    preview = content[:500].strip() + ("..." if char_count > 500 else "")
- 
-    # Detect chapter headings — exclude known boilerplate section titles
-    _EXCLUDE_TERMS = {
-        "GUTENBERG", "LICENSE", "ADDENDUM", "SECTION", "FOUNDATION",
-        "INFORMATION", "DONATIONS", "MISSION",
-    }
- 
-    heading_re = re.compile(
-        r"^(?:"
-        r"(?:CHAPTER|Chapter|PART|Part|BOOK|Book|SECTION|Section)\s+[\w]+[^\n]*"
-        r"|[IVXivx]{1,6}\.\s+[A-Z][^\n]+"
-        r"|[A-Z][A-Z\s]{4,50}"
-        r")$",
-        re.MULTILINE,
-    )
- 
-    chapters = []
-    for match in heading_re.finditer(content):
-        heading = match.group(0).strip()
-        # Skip if any boilerplate term appears in the heading
-        if any(term in heading.upper() for term in _EXCLUDE_TERMS):
-            continue
-        if len(heading) < 3:
-            continue
-        chapters.append((match.start(), heading))
- 
-    # Deduplicate hits within 50 chars of each other
-    deduped = []
-    for offset, text in chapters:
-        # Translate to raw file offset so it works flawlessly with read_book_content
-        raw_offset = offset + strip_offset
-        if deduped and raw_offset - deduped[-1][0] < 50:
-            continue
-        deduped.append((raw_offset, text))
- 
-    if deduped:
-        ch_lines = [f"\nDetected {len(deduped)} chapter/section offset(s):"]
-        for raw_offset, heading in deduped[:40]:
-            ch_lines.append(f"  char {raw_offset:>8,} — {heading[:80]}")
-        if len(deduped) > 40:
-            ch_lines.append(f"  ... and {len(deduped) - 40} more.")
-        ch_lines.append(
-            "\nPass any start_char to read_book_content() to begin at that chapter."
-        )
-        chapters_section = "\n".join(ch_lines)
-    else:
-        chapters_section = (
-            "\nNo chapter headings detected. Use start_char=0 to read from the beginning, "
-            "or use a start_char from gutenberg_prose_search results."
-        )
- 
-    return (
-        f"Book: {title}\n"
-        f"Author: {author}\n"
-        f"Language: {lang}\n"
-        f"Filename: {filename}\n\n"
-        f"Statistics (story content only, boilerplate excluded):\n"
-        f"  Characters:        {char_count:,}\n"
-        f"  Words:             {word_count:,}\n"
-        f"  Lines:             {line_count:,}\n"
-        f"  Est. reading time: {reading_min:.1f} min\n\n"
-        f"Preview (first 500 chars of story):\n{preview}"
-        f"{chapters_section}"
-    )
  
 @mcp.tool()
 async def read_book_content(
@@ -867,7 +593,7 @@ async def read_book_content(
     to story-content offsets internally.
 
     Args:
-        filename:           Exact filename from list_available_books.
+        filename:           Exact filename.
         start_char:         Starting character position in the raw file (default 0).
                             Use offsets directly from gutenberg_prose_search or
                             get_book_stats chapter offsets.
@@ -1032,7 +758,7 @@ async def gutenberg_debug_offsets(book_id: int, start_char: int) -> str:
         else:
             lines.append(
                 f"❌ No paragraphs found at all for book_id={book_id}.\n"
-                "   The book may not be indexed. Run gutenberg_index_stats() to check."
+                "   The book may not be indexed."
             )
             return "\n".join(lines)
 
