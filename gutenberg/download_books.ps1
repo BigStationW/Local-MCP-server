@@ -153,6 +153,28 @@ $searchd = Start-Process `
     -PassThru `
     -WindowStyle Hidden
 
+
+# ============================================================
+# NEW WATCHER PROCESS LOGIC
+# ============================================================
+# Start a completely hidden watcher process that waits for THIS script to die, 
+# and automatically cleans up searchd.exe if the "X" button is clicked.
+$WatcherArgs = "-NoProfile -Command `"Wait-Process -Id $PID -ErrorAction SilentlyContinue; Stop-Process -Id $($searchd.Id) -Force -ErrorAction SilentlyContinue`""
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = "powershell.exe"
+$psi.Arguments = $WatcherArgs
+$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$psi.CreateNoWindow = $true
+$psi.UseShellExecute = $false
+[System.Diagnostics.Process]::Start($psi) | Out-Null
+
+# We still register the graceful exit event, but correctly pass variables using -MessageData
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -MessageData $searchd.Id -Action {
+    Get-Process -Id $Event.MessageData -ErrorAction SilentlyContinue | Stop-Process -Force
+} | Out-Null
+# ============================================================
+
+
 # Poll port 9306 up to 30 seconds
 $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
@@ -171,7 +193,7 @@ if (-not $ready) {
     exit 1
 }
 
-Write-Host "  [OK] ManticoreSearch ready on port 9306."
+Write-Host "[OK] ManticoreSearch ready on port 9306."
 
 # ============================================================
 # STEP 3 - PYTHON DEPS
@@ -222,29 +244,10 @@ Write-Host ""
 Write-Host "[5/5] Starting indexer"
 Write-Host ""
 
-$LimitInput = Read-Host "How many books per language? (Just press Enter for all)"
-
-if ([string]::IsNullOrWhiteSpace($LimitInput) -or $LimitInput.Trim().ToLower() -eq "all") {
-    $MaxBooks = 0
-    Write-Host "  FULL MODE: all books."
-}
-elseif ($LimitInput.Trim() -match '^\d+$') {
-    $MaxBooks = [int]$LimitInput.Trim()
-    if ($MaxBooks -le 0) {
-        Write-Host "  Invalid number, defaulting to full download."
-        $MaxBooks = 0
-    }
-    else {
-        Write-Host "  LIMITED MODE: $MaxBooks book(s) per language."
-    }
-}
-else {
-    Write-Host "  Unrecognized input, defaulting to full download."
-    $MaxBooks = 0
-}
-
 $env:GUTENBERG_TXT_DIR = $BooksTxtDir
-& $PythonExe $IndexScript $MaxBooks
+
+# We only run this once because the Python script natively prompts for limits.
+& $PythonExe $IndexScript
 
 # ============================================================
 # DONE - STOP BACKGROUND PROCESS
