@@ -23,6 +23,11 @@ from markdownify import markdownify as md
 import re
 import atexit
 import signal
+from datetime import datetime
+import certifi
+import pymysql as _pymysql
+import re as _re
+
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -46,7 +51,7 @@ async def get_http_client() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
             follow_redirects=True,
-            http2=True,  # Enable HTTP/2 for better performance
+            http2=True,
             timeout=httpx.Timeout(30.0),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
@@ -248,6 +253,101 @@ def date_time() -> str:
 # ---------------------------------------------------------------------------
 # HTTP / WEB TOOLS
 # ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def gutenberg_prose_search(
+    query: str,
+    language: str = "en",
+    max_results: int = 5,
+) -> str:
+    """
+    Search the full prose text of all indexed Gutenberg books by concrete word clusters.
+    Returns highlighted matching paragraphs with book IDs and start_char offsets
+    ready to pass directly to gutenberg_fetch_passage.
+
+    Local Manticore Search index - no rate limits, no API keys, no Docker.
+    Requires the ManticoreSearch Windows service to be running.
+
+    Args:
+        query:       2-5 concrete physical words likely to co-occur in literary prose.
+                     Use syntactically mid-sentence fragments, NOT abstract mood words.
+                     Good: "lampe laiton ombre" / "velvet skin threshold"
+                     Bad:  "dark atmospheric sensual"
+        language:    Two-letter code to filter by language. Default "en".
+                     Use "fr" for French, "de" for German, etc.
+        max_results: Number of matching paragraphs to return (default 5).
+
+    Workflow: search -> pick best snippet -> gutenberg_fetch_passage(book_id, start_char)
+    """
+    words = [w.strip() for w in query.strip().split() if w.strip()]
+    if not words:
+        return "Empty query."
+
+    # Build a proximity query: word1 NEAR/10 word2 NEAR/10 word3 ...
+    fts = words[0] if len(words) == 1 else " NEAR/10 ".join(words)
+
+    # Basic SQL-quote escaping for strings placed in single quotes
+    fts_safe = fts.replace("'", "''")
+    lang_safe = language.replace("'", "")[:5]
+
+    snip_terms = " ".join(words)
+    snip_terms_safe = snip_terms.replace("'", "''")
+
+    sql = (
+        "SELECT book_id, title, author, language, start_char, "
+        f"SNIPPET(body, '{snip_terms_safe}', "
+        "'before_match=<b>, after_match=</b>, limit=300, around=10') AS snippet "
+        "FROM gutenberg_paragraphs "
+        f"WHERE MATCH('{fts_safe}') AND language='{lang_safe}' "
+        f"LIMIT {int(max_results)} "
+        "OPTION ranker=proximity_bm25, field_weights=(body=10,title=1)"
+    )
+
+    try:
+        conn = _pymysql.connect(
+            host="127.0.0.1",
+            port=9306,
+            user="",
+            password="",
+            database="",
+            charset="utf8mb4",
+            connect_timeout=5,
+        )
+        cur = conn.cursor(_pymysql.cursors.DictCursor)
+        cur.execute(sql)
+        rows = cur.fetchall()
+        conn.close()
+    except _pymysql.OperationalError as e:
+        return (
+            f"Cannot connect to Manticore Search: {e}\n"
+            "Make sure the ManticoreSearch Windows service is running.\n"
+            "Fix: Win+R -> services.msc -> ManticoreSearch -> Start"
+        )
+    except Exception as e:
+        return f"Manticore query error: {type(e).__name__}: {e}"
+
+    if not rows:
+        return (
+            f"No prose matches for '{query}' (language={language}).\n"
+            "Tips:\n"
+            "  - Use 2-4 concrete physical words\n"
+            "  - Try mid-sentence fragments: 'lamp cast shadow' not 'dark atmosphere'\n"
+            f"  - Make sure language='{language}' books were indexed\n"
+            "  - Try fewer words if getting zero results"
+        )
+
+    lines = [f"Found {len(rows)} prose match(es) for '{query}' (language={language}):\n"]
+    for i, row in enumerate(rows, 1):
+        snippet = _re.sub(r"</?b>", "**", row.get("snippet", "") or "")
+        lines.append(
+            f"{i}. {row['title']} by {row['author']}\n"
+            f"   Book ID: {row['book_id']} | start_char: {row['start_char']}\n"
+            f"   Match: ...{snippet[:400]}...\n"
+        )
+
+    lines.append("Next: gutenberg_fetch_passage(book_id=X, start_char=Y) on the best match.")
+    return "\n".join(lines)
+    
 @mcp.tool()
 async def image_search(query: str, max_results: int = 5) -> list:
     """
