@@ -169,38 +169,42 @@ def build_zip_urls(book_id):
 
     return urls
 
-def _decode_raw_text(data, hint=None):
+def _decode_raw_text(data, hint=None, book_id=None):
     header = data[:2000].decode("ascii", errors="ignore")
     enc_match = re.search(r'Character set encoding:\s*([a-zA-Z0-9-]+)', header, re.IGNORECASE)
-
-    if enc_match:
-        encoding = enc_match.group(1).lower()
-    elif hint:
-        encoding = hint
-    else:
-        encoding = "utf-8"
-
+    
+    # Try UTF-8 first
     try:
-        text = data.decode(encoding)
-    except (LookupError, UnicodeDecodeError):
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # Fall back to declared encoding or hint
+        if enc_match:
+            encoding = enc_match.group(1).lower()
+        elif hint:
+            encoding = hint
+        else:
+            encoding = "iso-8859-1"
+        
+        # ISO-8859-1 files from Gutenberg are often actually Windows-1252
+        # (they have smart quotes in the 0x80-0x9F range)
+        if encoding == "iso-8859-1":
+            encoding = "windows-1252"
+        
         try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                text = data.decode("iso-8859-1")
-            except:
-                text = data.decode("utf-8", errors="replace")
-
+            text = data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            text = data.decode("windows-1252", errors="replace")
+    
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     return normalize_unicode_punctuation(text)
 
-def _decode_zip(data):
+def _decode_zip(data, book_id=None):
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         for name in z.namelist():
             if name.endswith(".txt"):
                 raw_bytes = z.read(name)
-                hint = "iso-8859-1" if name.endswith("-8.txt") else "utf-8"
-                return _decode_raw_text(raw_bytes, hint)
+                hint = "windows-1252" if name.endswith("-8.txt") else "utf-8"
+                return _decode_raw_text(raw_bytes, hint, book_id)
     return None
 
 def download_text(book_id):
@@ -214,12 +218,12 @@ def download_text(book_id):
                 data = r.read()
 
             if url.endswith(".zip"):
-                result = _decode_zip(data)
+                result = _decode_zip(data, book_id)
                 if result:
                     return result
             else:
-                hint = "iso-8859-1" if url.endswith("-8.txt") else "utf-8"
-                return _decode_raw_text(data, hint)
+                hint = "windows-1252" if url.endswith("-8.txt") else "utf-8"
+                return _decode_raw_text(data, hint, book_id)
 
         except Exception:
             continue
