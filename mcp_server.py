@@ -548,30 +548,31 @@ async def gutenberg_prose_search(
                 f"   Match: {snippet}\n"
             )
 
-        next_offset = offset + len(rows)
-        prev_offset = max(0, offset - max_results)
+    next_offset = offset + len(rows)
+    prev_offset = max(0, offset - max_results)
 
-        next_steps = ["\nNext steps:"]
-        if next_offset < total_found:
-            next_steps.append(
-                f"  • Continue  → gutenberg_prose_search(query='{query}', offset={next_offset}, max_results={max_results})"
-            )
-        if offset > 0:
-            next_steps.append(
-                f"  • Go back   → gutenberg_prose_search(query='{query}', offset={prev_offset}, max_results={max_results})"
-            )
-        if _GUTENBERG_CATALOG:
-            next_steps.append(
-                "  • Read text → read_book_content(filename=<filename>, start_char=<start_char>)"
-            )
-        else:
-            next_steps.append(
-                "  • Read text → read_book_content(filename=<filename>, start_char=<start_char>)"
-            )
+    next_steps = ["\nNext steps:"]
+    if next_offset < total_found:
         next_steps.append(
-            f"  Total found: {total_found} | Currently showing: {first}–{last}"
+            f"  • Continue  → gutenberg_prose_search(query='{query}', offset={next_offset}, max_results={max_results})"
         )
-        lines.append("\n".join(next_steps))
+    if offset > 0:
+        next_steps.append(
+            f"  • Go back   → gutenberg_prose_search(query='{query}', offset={prev_offset}, max_results={max_results})"
+        )
+    if _GUTENBERG_CATALOG:
+        next_steps.append(
+            "  • Read text → read_book_content(filename=<filename>, start_char=<start_char>)"
+        )
+    else:
+        next_steps.append(
+            "  • Read text → read_book_content(filename=<filename>, start_char=<start_char>)"
+        )
+    next_steps.append(
+        f"  Total found: {total_found} | Currently showing: {first}–{last}"
+    )
+    lines.append("\n".join(next_steps))
+
     return "\n".join(lines)
  
 @mcp.tool()
@@ -579,8 +580,7 @@ async def read_book_content(
     filename: str,
     start_char: int = 0,
     end_char: int = -1,
-    max_chars: int = 3000,
-    align_to_paragraph: bool = True,
+    max_chars: int = 5000,
 ) -> str:
     """
     Read a passage from a Gutenberg book.
@@ -600,8 +600,6 @@ async def read_book_content(
         end_char:           Ending position in the raw file. Default -1 = start + max_chars.
         max_chars:          Maximum characters to return (default 3000).
                             Set to 0 for no limit.
-        align_to_paragraph: If True, walk start back up to 2000 chars to find
-                            the nearest paragraph boundary.
 
     Returns: The passage with position metadata and a continue hint.
     """
@@ -640,14 +638,6 @@ async def read_book_content(
             "Use get_book_stats() to see actual story length and chapter offsets."
         )
 
-    # Walk back to nearest paragraph boundary
-    if align_to_paragraph and content_start > 0:
-        look_back  = max(0, content_start - 2000)
-        segment    = content[look_back:content_start]
-        last_blank = segment.rfind("\n\n")
-        if last_blank != -1:
-            content_start = look_back + last_blank + 2
-
     # Resolve end
     if end_char == -1 or end_char <= start_char:
         content_end = content_start + (max_chars if max_chars > 0 else total_length)
@@ -676,13 +666,12 @@ async def read_book_content(
 
     return "\n".join([
         f"Book: {filename}",
-        f"Passage: raw file chars {reported_start:,}–{reported_end:,} ({actual_length:,} chars of story)",
-        f"Story length (boilerplate excluded): {total_length:,} chars",
-        f"Header/boilerplate size: {strip_offset:,} chars",
+        f"Passage: raw file chars {reported_start}-{reported_end} ({actual_length} chars of story)",
+        f"Story length (boilerplate excluded): {total_length} chars",
         f"\n{'=' * 60}\n",
         passage,
         f"\n{'=' * 60}",
-        f"End of passage (raw {reported_start:,}–{reported_end:,} of {total_length + strip_offset:,})",
+        f"End of passage (raw {reported_start}-{reported_end} of {total_length + strip_offset})",
         f"To continue reading: read_book_content(filename='{filename}', start_char={reported_end})",
     ])
 
