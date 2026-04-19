@@ -492,21 +492,23 @@ async def gutenberg_prose_search(
                 snippet = body[:400 + match.start() + 1]
             else:
                 snippet = body[:400].rsplit(' ', 1)[0] + '…' 
+        
+        end_char = row['start_char'] + len(snippet)
 
         filename = _GUTENBERG_CATALOG.get(row['book_id'])
 
         if filename:
             lines.append(
                 f"{i}. {row['title']} by {row['author']}\n"
-                f"   book_id: {row['book_id']} | start_char: {row['start_char']}\n"
+                f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
                 f"   filename: {filename}\n"
-                f"   Match: {snippet}\n"
+                f"   Match: {snippet}\n\n"
             )
         else:
             lines.append(
                 f"{i}. {row['title']} by {row['author']}\n"
-                f"   book_id: {row['book_id']} | start_char: {row['start_char']}\n"
-                f"   Match: {snippet}\n"
+                f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
+                f"   Match: {snippet}\n\n"
             )
 
     next_offset = offset + len(rows)
@@ -534,7 +536,7 @@ async def gutenberg_prose_search(
     )
     lines.append("\n".join(next_steps))
 
-    return "\n".join(lines)
+    return "\n\u00A0\n".join(lines)
  
 @mcp.tool()
 async def read_book_content(
@@ -628,7 +630,7 @@ async def read_book_content(
     return "\n".join([
         f"Book: {filename}",
         f"Passage: raw file chars {reported_start}-{reported_end} ({actual_length} chars of story)",
-        f"Story length (boilerplate excluded): {total_length} chars",
+        f"Story length: {total_length} chars",
         f"\n{'=' * 60}\n",
         passage,
         f"\n{'=' * 60}",
