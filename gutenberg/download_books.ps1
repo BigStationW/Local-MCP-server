@@ -224,17 +224,8 @@ if (-not (Test-Path $IndexScript)) {
     exit 1
 }
 
-$LangArray = ($Languages | ForEach-Object { "'$_'" }) -join ", "
-
-$Content = Get-Content $IndexScript -Raw
-$Content = [regex]::Replace(
-    $Content,
-    '(?m)^\s*LANGUAGES\s*=.*$',
-    "LANGUAGES = [$LangArray]"
-)
-$Content | Set-Content $IndexScript -Encoding UTF8
-
-Write-Host "  Index script ready with languages: $($Languages -join ', ')"
+$env:GUTENBERG_LANGUAGES = $Languages -join ','
+Write-Host "  Index script will use languages: $($Languages -join ', ')"
 
 # ============================================================
 # STEP 5 - RUN INDEXER
