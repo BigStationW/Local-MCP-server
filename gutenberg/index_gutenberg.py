@@ -3,24 +3,44 @@ import pymysql
 
 LANGUAGES = os.environ.get("GUTENBERG_LANGUAGES", "en").split(',')
 CHUNK_CHARS = 600
-BATCH_SIZE  = 300
-SLEEP_SEC   = 1.0
+BATCH_SIZE = 300
+SLEEP_SEC = 1.0
 
 MANTICORE_HOST = '127.0.0.1'
 MANTICORE_PORT = 9306
 
-SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BOOKS_BASE_DIR = os.path.join(SCRIPT_DIR, "books")
-BOOKS_TXT_DIR  = os.environ.get("GUTENBERG_TXT_DIR", os.path.join(BOOKS_BASE_DIR, "txt"))
+BOOKS_TXT_DIR = os.environ.get("GUTENBERG_TXT_DIR", os.path.join(BOOKS_BASE_DIR, "txt"))
 BOOKS_INDEX_DIR = os.path.join(BOOKS_BASE_DIR, "index")
 
-# Catalog URL — single ~14 MB gzipped CSV, much more complete than the harvest robot
+# Catalog URL — single ~14 MB gzipped CSV
 CATALOG_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# Unicode normalization
+UNICODE_REPLACEMENTS = [
+    ('\u2019', "'"),
+    ('\u2018', "'"),
+    ('\u02bc', "'"),
+    ('\u0060', "'"),
+    ('\u00b4', "'"),
+    ('\u201c', '"'),
+    ('\u201d', '"'),
+    ('\u201e', '"'),
+    ('\u2014', ' -- '),
+    ('\u2013', '-'),
+    ('\u2011', '-'),
+    ('\u00ad', ''),
+    ('\u200b', ''),
+    ('\ufeff', ''),
+]
 
+def normalize_unicode_punctuation(text):
+    for src, dst in UNICODE_REPLACEMENTS:
+        text = text.replace(src, dst)
+    return text
+
+# Helpers
 def sanitize_filename(s):
     s = re.sub(r'[<>:"/\\|?*]', '', s)
     s = re.sub(r'\s+', ' ', s).strip()
@@ -35,18 +55,17 @@ def get_conn():
 
 def create_table(conn):
     cur = conn.cursor()
-    # Remove the DROP — let it persist across runs
     cur.execute("""
         CREATE TABLE IF NOT EXISTS gutenberg_paragraphs (
-            book_id   integer,
-            title     text,
-            author    text,
-            language  string,
+            book_id integer,
+            title text,
+            author text,
+            language string,
             start_char integer,
-            body      text
+            body text
         ) morphology='stem_en,libstemmer_fr,libstemmer_de,libstemmer_it,libstemmer_es'
-          min_stemming_len='2'
-          index_sp='1'
+        min_stemming_len='2'
+        index_sp='1'
     """)
     conn.commit()
     print("Table ready.")
@@ -55,7 +74,7 @@ def create_meta_table(conn):
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS gutenberg_meta (
-            book_id   integer,
+            book_id integer,
             char_count integer
         )
     """)
@@ -71,10 +90,7 @@ def bulk_insert(conn, rows):
     cur.executemany(sql, rows)
     conn.commit()
 
-# ---------------------------------------------------------------------------
 # Catalog download
-# ---------------------------------------------------------------------------
-
 def fetch_catalog(wanted_langs):
     os.makedirs(BOOKS_BASE_DIR, exist_ok=True)
     catalog_path = os.path.join(BOOKS_BASE_DIR, "pg_catalog.csv")
@@ -86,9 +102,9 @@ def fetch_catalog(wanted_langs):
     else:
         print(f"Downloading catalog from {CATALOG_URL} ...")
         hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
-        ctx  = ssl.create_default_context()
+        ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
+        ctx.verify_mode = ssl.CERT_NONE
 
         req = urllib.request.Request(CATALOG_URL, headers=hdrs)
         with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
@@ -102,16 +118,17 @@ def fetch_catalog(wanted_langs):
 
         print(f"  Catalog saved to {catalog_path}")
 
-    # Parse CSV
     reader = csv.DictReader(io.StringIO(csv_bytes.decode('utf-8', errors='replace')))
     rows = list(reader)
 
     def norm(d):
         return {k.strip().lstrip('\ufeff'): v.strip() for k, v in d.items()}
+
     rows = [norm(r) for r in rows]
 
     wanted = set(l.strip().lower() for l in wanted_langs)
     kept = []
+
     for r in rows:
         if r.get('Type', '').lower() != 'text':
             continue
@@ -120,38 +137,32 @@ def fetch_catalog(wanted_langs):
             continue
         kept.append(r)
 
-    print(f"  {len(rows):,} total entries → {len(kept):,} text books in {wanted_langs}")
+    print(f" {len(rows):,} total entries → {len(kept):,} text books in {wanted_langs}")
     return kept
 
-# ---------------------------------------------------------------------------
 # Per-book download
-# ---------------------------------------------------------------------------
-
 def _ssl_ctx():
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
+    ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 def build_zip_urls(book_id):
     sid = str(book_id)
-    urls =[]
+    urls = []
 
-    # For newer books (ID >= 100), the cache endpoint usually works
     if book_id >= 100:
         urls.append(f"https://www.gutenberg.org/cache/epub/{sid}/pg{sid}.txt.utf8")
 
-    # Primary modern plain-text URLs
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}-0.txt") # UTF-8
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}-8.txt") # ISO-8859-1 (Common for older FR/DE texts)
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}.txt")   # ASCII fallback
+    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}-0.txt")
+    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}-8.txt")
+    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}.txt")
 
-    # Aleph mirror zips (last resort)
     if len(sid) == 1:
         dir_path = f"0/{sid}"
     else:
         dir_path = "/".join(sid[:-1]) + f"/{sid}"
-        
+
     urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}-0.zip")
     urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}-8.zip")
     urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}.zip")
@@ -159,21 +170,19 @@ def build_zip_urls(book_id):
     return urls
 
 def _decode_raw_text(data, hint=None):
-    """Detect encoding from Gutenberg header and decode safely."""
     header = data[:2000].decode("ascii", errors="ignore")
-    enc_match = re.search(r'Character set encoding:\s*([a-zA-Z0-9\-]+)', header, re.IGNORECASE)
-    
+    enc_match = re.search(r'Character set encoding:\s*([a-zA-Z0-9-]+)', header, re.IGNORECASE)
+
     if enc_match:
         encoding = enc_match.group(1).lower()
     elif hint:
         encoding = hint
     else:
         encoding = "utf-8"
-        
+
     try:
         text = data.decode(encoding)
     except (LookupError, UnicodeDecodeError):
-        # Fallback sequence: UTF-8 -> ISO-8859-1 -> Replace
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -181,31 +190,29 @@ def _decode_raw_text(data, hint=None):
                 text = data.decode("iso-8859-1")
             except:
                 text = data.decode("utf-8", errors="replace")
-                
-    # Normalize newlines to prevent offset drift across OS/readers
-    return text.replace('\r\n', '\n').replace('\r', '\n')
+
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    return normalize_unicode_punctuation(text)
 
 def _decode_zip(data):
-    """Extract and decode the first .txt entry from a zip blob."""
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         for name in z.namelist():
             if name.endswith(".txt"):
                 raw_bytes = z.read(name)
-                # Apply encoding hint based on filename conventions
                 hint = "iso-8859-1" if name.endswith("-8.txt") else "utf-8"
                 return _decode_raw_text(raw_bytes, hint)
     return None
 
 def download_text(book_id):
     hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
-    ctx  = _ssl_ctx()
+    ctx = _ssl_ctx()
 
     for url in build_zip_urls(book_id):
         try:
             req = urllib.request.Request(url, headers=hdrs)
             with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
                 data = r.read()
-                
+
             if url.endswith(".zip"):
                 result = _decode_zip(data)
                 if result:
@@ -213,28 +220,15 @@ def download_text(book_id):
             else:
                 hint = "iso-8859-1" if url.endswith("-8.txt") else "utf-8"
                 return _decode_raw_text(data, hint)
-                
-        except Exception:
-            continue  # try next URL silently
 
-    print(f"    WARNING: all URLs failed for book {book_id}")
+        except Exception:
+            continue
+
+    print(f" WARNING: all URLs failed for book {book_id}")
     return None
 
-# ---------------------------------------------------------------------------
 # Text processing
-# ---------------------------------------------------------------------------
-
 def chunk_prose(text):
-    """
-    Splits text into chunks of ~CHUNK_CHARS, preserving exact character offsets
-    into the original `text` string.
-
-    Key invariant: chunk_start_offset is always the exact index in `text` where
-    the first paragraph of that chunk begins — computed by summing part lengths,
-    never by calling str.find() (which can match the wrong occurrence of a
-    repeated phrase and cause offset drift).
-    """
-    # Split keeping the delimiters (odd-indexed elements) so we can measure them.
     parts = re.split(r'(\n\s*\n)', text)
     chunks = []
 
@@ -244,10 +238,9 @@ def chunk_prose(text):
 
     i = 0
     while i < len(parts):
-        para_raw  = parts[i]
+        para_raw = parts[i]
         para_text = para_raw.strip()
 
-        # Offset of the first non-whitespace character of this paragraph in `text`.
         leading_ws = len(para_raw) - len(para_raw.lstrip())
         para_content_start = raw_offset + leading_ws
 
@@ -255,7 +248,6 @@ def chunk_prose(text):
             if not current_chunk:
                 chunk_start_offset = para_content_start
 
-            # Flush current chunk before it would exceed CHUNK_CHARS
             if len(current_chunk) + len(para_text) > CHUNK_CHARS and current_chunk:
                 chunks.append((current_chunk, chunk_start_offset))
                 current_chunk = ""
@@ -263,10 +255,8 @@ def chunk_prose(text):
 
             current_chunk += ("\n\n" if current_chunk else "") + para_text
 
-        # Advance by the exact length of this paragraph part
         raw_offset += len(para_raw)
 
-        # Consume the following delimiter (odd index) if present
         if i + 1 < len(parts):
             raw_offset += len(parts[i + 1])
             i += 2
@@ -301,7 +291,7 @@ def delete_book_from_index(conn, book_id):
     conn.commit()
     cur.execute("DELETE FROM gutenberg_meta WHERE book_id = %s", (book_id,))
     conn.commit()
-    print(f"    Deleted old index entries for book_id={book_id}.")
+    print(f" Deleted old index entries for book_id={book_id}.")
 
 def save_char_count(conn, book_id, char_count):
     cur = conn.cursor()
@@ -313,10 +303,7 @@ def save_char_count(conn, book_id, char_count):
     )
     conn.commit()
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
-
 def main():
     print(f"\nConnecting to Manticore {MANTICORE_HOST}:{MANTICORE_PORT}...")
     try:
@@ -337,92 +324,94 @@ def main():
     for row in catalog:
         per_lang[row['Language'].strip().lower()].append(row)
 
-    print("")
-    print("  Books available per language:")
+    print("\n Books available per language:")
     for lang, rows in sorted(per_lang.items()):
-        print(f"    {lang}: {len(rows):,}")
-    total_available = sum(len(v) for v in per_lang.values())
-    print(f"    ─────────────────")
-    print(f"    Total: {total_available:,}")
-    print("")
+        print(f" {lang}: {len(rows):,}")
 
-    # Automatically skip limits if you pass CLI arguments, otherwise prompt
+    total_available = sum(len(v) for v in per_lang.values())
+    print(f" ─────────────────")
+    print(f" Total: {total_available:,}\n")
+
     if len(sys.argv) > 1:
         limit_input = sys.argv[1]
     else:
-        limit_input = input("  How many books per language? (Just press Enter for all): ").strip()
+        limit_input = input(" How many books per language? (Just press Enter for all): ").strip()
 
     if not limit_input or limit_input.lower() == "all":
         max_books = 0
-        print(f"  FULL MODE: all {total_available:,} books.")
+        print(f" FULL MODE: all {total_available:,} books.")
     elif limit_input.isdigit() and int(limit_input) > 0:
         max_books = int(limit_input)
         capped = sum(min(len(v), max_books) for v in per_lang.values())
-        print(f"  LIMITED MODE: up to {max_books:,} per language ({capped:,} total).")
+        print(f" LIMITED MODE: up to {max_books:,} per language ({capped:,} total).")
     else:
         max_books = 0
-        print(f"  Unrecognized input, defaulting to full download ({total_available:,} books).")
+        print(f" Unrecognized input, defaulting to full download ({total_available:,} books).")
+
     print("")
 
     if max_books > 0:
-        catalog =[]
+        catalog = []
         for lang_rows in per_lang.values():
             catalog.extend(lang_rows[:max_books])
 
     total = 0
-    batch =[]
+    batch = []
 
     for idx, row in enumerate(catalog, 1):
         book_id = int(row.get('Text#', 0) or 0)
-        title   = row.get('Title',   'Unknown').strip() or 'Unknown'
-        author  = row.get('Authors', 'Unknown').strip() or 'Unknown'
-        lang    = row.get('Language', '').strip().lower()
+        title = row.get('Title', 'Unknown').strip() or 'Unknown'
+        author = row.get('Authors', 'Unknown').strip() or 'Unknown'
+        lang = row.get('Language', '').strip().lower()
 
         if not book_id:
             continue
 
-        book_filename = (
-            f"{sanitize_filename(author)} - {sanitize_filename(title)} ({lang}).txt"
-        )
+        book_filename = f"{sanitize_filename(author)} - {sanitize_filename(title)} ({lang}).txt"
         book_path = os.path.join(BOOKS_TXT_DIR, book_filename)
 
         print(f"[{idx}/{len(catalog)}] #{book_id} — {title[:60]}")
 
         if os.path.exists(book_path) and is_already_indexed(conn, book_id):
-            # Check if the file on disk has changed since indexing (e.g. re-downloaded)
             with open(book_path, encoding='utf-8', errors='replace') as f:
                 disk_content = f.read()
+
             disk_char_count = len(disk_content)
             stored_size = get_indexed_char_count(conn, book_id)
-            if abs(disk_char_count - stored_size) < 1000:  # within 1KB tolerance
-                print(f"    Already indexed and file unchanged, skipping.")
+
+            if abs(disk_char_count - stored_size) < 1000:
+                print("    Already indexed and file unchanged, skipping.")
                 continue
             else:
                 print(f"    File changed since indexing (disk={disk_char_count}, indexed≈{stored_size}), re-indexing.")
                 delete_book_from_index(conn, book_id)
                 raw = disk_content
+
         elif os.path.exists(book_path):
-            print(f"    File exists, indexing from disk.")
+            print("    File exists, indexing from disk.")
             with open(book_path, encoding='utf-8', errors='replace') as f:
                 raw = f.read()
+
         else:
             raw = download_text(book_id)
             if not raw:
                 continue
-            with open(book_path, 'w', encoding='utf-8') as f:
+
+            with open(book_path, 'w', encoding='utf-8-sig') as f:
                 f.write(raw)
+
             print(f"    Saved: books/txt/{book_filename}")
             time.sleep(SLEEP_SEC)
-        
+
         save_char_count(conn, book_id, len(raw))
-        
+
         if len(raw) < 200:
             print(f"    SKIPPED: text too short ({len(raw)} chars).")
             continue
 
         chunks = chunk_prose(raw)
         if not chunks:
-            print(f"    SKIPPED: no chunks generated.")
+            print("    SKIPPED: no chunks generated.")
             continue
 
         for chunk_text, start_char in chunks:
