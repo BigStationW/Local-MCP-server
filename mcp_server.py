@@ -250,23 +250,40 @@ _GUTENBERG_START_MARKERS = [
     "***START OF THE PROJECT GUTENBERG",
 ]
 
-def _strip_gutenberg(text: str) -> str:
-    # Fix 1: Strip BOM
-    text = text.lstrip('\ufeff')
+def _strip_gutenberg(text: str) -> tuple[str, int]:
+    """
+    Strip Gutenberg boilerplate from raw text.
 
-    # 1. Strip the end
+    Returns:
+        (story_content, strip_offset) where strip_offset is the number of
+        characters removed from the front of the original text. All offsets
+        stored in the index (raw-file positions) can be translated to
+        story-content positions by subtracting strip_offset.
+    """
+    # Strip BOM
+    stripped = text.lstrip('\ufeff')
+    bom_len = len(text) - len(stripped)
+    text = stripped
+
+    # Strip the end
     end_indices = [text.find(m) for m in _GUTENBERG_END_MARKERS if text.find(m) != -1]
     if end_indices:
         text = text[:min(end_indices)]
 
-    # 2. Strip the start
+    # Strip the start and record how many chars were removed from the front
+    strip_offset = bom_len
     start_indices = [text.find(m) for m in _GUTENBERG_START_MARKERS if text.find(m) != -1]
     if start_indices:
         start_idx = min(start_indices)
         eol = text.find('\n', start_idx)
-        text = text[eol + 1:] if eol != -1 else text[start_idx:]
+        if eol != -1:
+            strip_offset += eol + 1
+            text = text[eol + 1:]
+        else:
+            strip_offset += start_idx
+            text = text[start_idx:]
 
-    return text.strip()
+    return text.strip(), strip_offset
  
 def _manticore_conn():
     return _pymysql.connect(
@@ -600,7 +617,7 @@ async def list_available_books(
         lines.append(f"   Filename: {book['filename']}\n")
  
     return "\n".join(lines)
- 
+
 @mcp.tool()
 async def get_book_stats(filename: str) -> str:
     """
@@ -715,27 +732,30 @@ async def read_book_content(
 ) -> str:
     """
     Read a passage from a Gutenberg book.
- 
+
     Gutenberg license text and boilerplate are automatically stripped —
     you will never receive license content regardless of start_char.
- 
+
+    start_char and end_char are raw-file offsets, exactly as returned by
+    gutenberg_prose_search and get_book_stats. The tool handles translation
+    to story-content offsets internally.
+
     Args:
         filename:           Exact filename from list_available_books.
-        start_char:         Starting character position (default 0 = beginning of story).
-                            Use offsets from get_book_stats or gutenberg_prose_search.
-        end_char:           Ending position. Default -1 = start_char + max_chars.
-        max_chars:          Maximum characters to return (default 3 000).
-                            Increase deliberately when you need a longer passage.
-                            Set to 0 for no limit (use with care).
-        align_to_paragraph: If True (default), walk start_char back up to 500 chars
-                            to find the nearest blank line, so the passage always
-                            starts at a clean paragraph boundary.
- 
-    Returns: The passage with position metadata and a "continue" hint.
+        start_char:         Starting character position in the raw file (default 0).
+                            Use offsets directly from gutenberg_prose_search or
+                            get_book_stats chapter offsets.
+        end_char:           Ending position in the raw file. Default -1 = start + max_chars.
+        max_chars:          Maximum characters to return (default 3000).
+                            Set to 0 for no limit.
+        align_to_paragraph: If True, walk start back up to 2000 chars to find
+                            the nearest paragraph boundary.
+
+    Returns: The passage with position metadata and a continue hint.
     """
     books_dir = os.path.join(os.path.dirname(__file__), "gutenberg", "books", "txt")
     filepath  = os.path.join(books_dir, filename)
- 
+
     if not os.path.exists(filepath):
         available = (
             [f for f in os.listdir(books_dir) if f.endswith(".txt")]
@@ -746,41 +766,45 @@ async def read_book_content(
             if available else ""
         )
         return f"Book not found: {filename}{hint}"
- 
+
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             raw = f.read()
     except Exception as e:
         return f"Error reading book: {type(e).__name__}: {e}"
- 
-    # Strip boilerplate FIRST — offsets now refer to clean story text
-    content      = _strip_gutenberg(raw)
+
+    content, strip_offset = _strip_gutenberg(raw)
     total_length = len(content)
-    start_char   = max(0, start_char)
- 
-    # Clamp start_char to story length (prevents reading into stripped territory)
-    if start_char >= total_length:
+
+    # Clamp: if start_char is inside the header, begin at story start
+    raw_start   = max(start_char, strip_offset)
+    content_start = raw_start - strip_offset
+    content_start = max(0, min(content_start, total_length))
+
+    if content_start >= total_length:
         return (
             f"start_char={start_char:,} is beyond the end of the story "
-            f"({total_length:,} chars after boilerplate is removed).\n"
-            "Use get_book_stats() to see the actual story length and chapter offsets."
+            f"({total_length:,} story chars, header is {strip_offset:,} chars).\n"
+            "Use get_book_stats() to see actual story length and chapter offsets."
         )
- 
+
     # Walk back to nearest paragraph boundary
-    if align_to_paragraph and start_char > 0:
-        look_back   = max(0, start_char - 500)
-        segment     = content[look_back:start_char]
-        last_blank  = segment.rfind("\n\n")
+    if align_to_paragraph and content_start > 0:
+        look_back  = max(0, content_start - 2000)
+        segment    = content[look_back:content_start]
+        last_blank = segment.rfind("\n\n")
         if last_blank != -1:
-            start_char = look_back + last_blank + 2
- 
-    # Resolve end_char
+            content_start = look_back + last_blank + 2
+
+    # Resolve end
     if end_char == -1 or end_char <= start_char:
-        end_char = start_char + (max_chars if max_chars > 0 else total_length)
-    end_char = min(end_char, total_length)
- 
-    actual_length = end_char - start_char
- 
+        content_end = content_start + (max_chars if max_chars > 0 else total_length)
+    else:
+        content_end = end_char - strip_offset
+    content_end = min(content_end, total_length)
+
+    actual_length = content_end - content_start
+
     if max_chars > 0 and actual_length > max_chars:
         return (
             f"Requested passage ({actual_length:,} chars) exceeds max_chars={max_chars:,}.\n"
@@ -788,21 +812,26 @@ async def read_book_content(
             f"Story length (boilerplate excluded): {total_length:,} chars.\n"
             f"Tip: get_book_stats('{filename}') shows chapter offsets."
         )
- 
-    if start_char >= end_char:
-        return f"Invalid range: start_char ({start_char:,}) >= end_char ({end_char:,})"
- 
-    passage = content[start_char:end_char]
- 
+
+    if content_start >= content_end:
+        return f"Invalid range after offset translation: [{content_start:,}, {content_end:,})"
+
+    passage = content[content_start:content_end]
+
+    # Report positions as raw-file offsets so the LLM can pass them back unchanged
+    reported_start = content_start + strip_offset
+    reported_end   = content_end   + strip_offset
+
     return "\n".join([
         f"Book: {filename}",
-        f"Passage: chars {start_char:,}–{end_char:,} ({actual_length:,} chars)",
+        f"Passage: raw file chars {reported_start:,}–{reported_end:,} ({actual_length:,} chars of story)",
         f"Story length (boilerplate excluded): {total_length:,} chars",
+        f"Header/boilerplate size: {strip_offset:,} chars",
         f"\n{'=' * 60}\n",
         passage,
         f"\n{'=' * 60}",
-        f"End of passage (chars {start_char:,}–{end_char:,} of {total_length:,})",
-        f"To continue reading: read_book_content(filename='{filename}', start_char={end_char})",
+        f"End of passage (raw {reported_start:,}–{reported_end:,} of {total_length + strip_offset:,})",
+        f"To continue reading: read_book_content(filename='{filename}', start_char={reported_end})",
     ])
 
 # ---------------------------------------------------------------------------
