@@ -1,7 +1,7 @@
 import re, time, io, zipfile, gzip, csv, urllib.request, sys, ssl, os
 import pymysql
-import itertools
-LANGUAGES = ['en']
+
+LANGUAGES = os.environ.get("GUTENBERG_LANGUAGES", "en").split(',')
 CHUNK_CHARS = 600
 BATCH_SIZE  = 300
 SLEEP_SEC   = 1.0
@@ -16,15 +16,6 @@ BOOKS_INDEX_DIR = os.path.join(BOOKS_BASE_DIR, "index")
 
 # Catalog URL — single ~14 MB gzipped CSV, much more complete than the harvest robot
 CATALOG_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
-
-HEADER_RE = re.compile(
-    r'\*\*\* START OF (?:THIS |THE )?PROJECT GUTENBERG EBOOK.*?\*\*\*',
-    re.IGNORECASE | re.DOTALL
-)
-FOOTER_RE = re.compile(
-    r'\*\*\* END OF (?:THIS |THE )?PROJECT GUTENBERG EBOOK.*?',
-    re.IGNORECASE | re.DOTALL
-)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,9 +35,9 @@ def get_conn():
 
 def create_table(conn):
     cur = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS gutenberg_paragraphs")
+    # Remove the DROP — let it persist across runs
     cur.execute("""
-        CREATE TABLE gutenberg_paragraphs (
+        CREATE TABLE IF NOT EXISTS gutenberg_paragraphs (
             book_id   integer,
             title     text,
             author    text,
@@ -58,7 +49,7 @@ def create_table(conn):
           index_sp='1'
     """)
     conn.commit()
-    print("Table created.")
+    print("Table ready.")
 
 def bulk_insert(conn, rows):
     if not rows:
@@ -75,34 +66,42 @@ def bulk_insert(conn, rows):
 # ---------------------------------------------------------------------------
 
 def fetch_catalog(wanted_langs):
-    print(f"Downloading catalog from {CATALOG_URL} ...")
-    hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
-    ctx  = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-
-    req = urllib.request.Request(CATALOG_URL, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
-        raw_gz = r.read()
-
-    print(f"  Downloaded {len(raw_gz):,} bytes. Parsing...")
-    csv_bytes = gzip.decompress(raw_gz)
-
     os.makedirs(BOOKS_BASE_DIR, exist_ok=True)
     catalog_path = os.path.join(BOOKS_BASE_DIR, "pg_catalog.csv")
-    with open(catalog_path, 'wb') as f:
-        f.write(csv_bytes)
-    print(f"  Catalog saved to books/pg_catalog.csv")
 
+    if os.path.exists(catalog_path):
+        print(f"Using cached catalog: {catalog_path}")
+        with open(catalog_path, 'rb') as f:
+            csv_bytes = f.read()
+    else:
+        print(f"Downloading catalog from {CATALOG_URL} ...")
+        hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
+        ctx  = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+
+        req = urllib.request.Request(CATALOG_URL, headers=hdrs)
+        with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
+            raw_gz = r.read()
+
+        print(f"  Downloaded {len(raw_gz):,} bytes. Decompressing...")
+        csv_bytes = gzip.decompress(raw_gz)
+
+        with open(catalog_path, 'wb') as f:
+            f.write(csv_bytes)
+
+        print(f"  Catalog saved to {catalog_path}")
+
+    # Parse CSV
     reader = csv.DictReader(io.StringIO(csv_bytes.decode('utf-8', errors='replace')))
     rows = list(reader)
 
     def norm(d):
         return {k.strip().lstrip('\ufeff'): v.strip() for k, v in d.items()}
-    rows =[norm(r) for r in rows]
+    rows = [norm(r) for r in rows]
 
     wanted = set(l.strip().lower() for l in wanted_langs)
-    kept =[]
+    kept = []
     for r in rows:
         if r.get('Type', '').lower() != 'text':
             continue
@@ -212,15 +211,6 @@ def download_text(book_id):
 # Text processing
 # ---------------------------------------------------------------------------
 
-def strip_gutenberg(text):
-    m = HEADER_RE.search(text)
-    if m:
-        text = text[m.end():]
-    m = FOOTER_RE.search(text)
-    if m:
-        text = text[:m.start()]
-    return text.strip()
-
 def chunk_prose(text):
     paras    = re.split(r'\n\s*\n', text)
     chunks   =[]
@@ -241,6 +231,14 @@ def chunk_prose(text):
     if buf.strip():
         chunks.append((buf.strip(), buf_start))
     return chunks
+
+def is_already_indexed(conn, book_id):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM gutenberg_paragraphs WHERE book_id = %s LIMIT 1",
+        (book_id,)
+    )
+    return cur.fetchone()[0] > 0
 
 # ---------------------------------------------------------------------------
 # Main
@@ -316,26 +314,32 @@ def main():
 
         print(f"[{idx}/{len(catalog)}] #{book_id} — {title[:60]}")
 
-        if os.path.exists(book_path):
-            print(f"    Already exists, re-indexing from disk.")
+        if os.path.exists(book_path) and is_already_indexed(conn, book_id):
+            print(f"    Already indexed, skipping.")
+            continue
+        elif os.path.exists(book_path):
+            print(f"    File exists, indexing from disk.")
             with open(book_path, encoding='utf-8', errors='replace') as f:
                 raw = f.read()
         else:
             raw = download_text(book_id)
             if not raw:
                 continue
-
-            # We write everything back to disk as pure UTF-8, regardless of source encoding
             with open(book_path, 'w', encoding='utf-8') as f:
                 f.write(raw)
             print(f"    Saved: books/txt/{book_filename}")
             time.sleep(SLEEP_SEC)
 
-        prose = strip_gutenberg(raw)
-        if len(prose) < 200:
+        if len(raw) < 200:
+            print(f"    SKIPPED: text too short ({len(raw)} chars).")
             continue
 
-        for chunk_text, start_char in chunk_prose(prose):
+        chunks = chunk_prose(raw)
+        if not chunks:
+            print(f"    SKIPPED: no chunks generated.")
+            continue
+
+        for chunk_text, start_char in chunks:
             batch.append((book_id, title, author, lang, start_char, chunk_text))
             if len(batch) >= BATCH_SIZE:
                 bulk_insert(conn, batch)
