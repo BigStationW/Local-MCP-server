@@ -483,7 +483,15 @@ async def gutenberg_prose_search(
     for i, row in enumerate(rows, 1):
         body = (row.get("body") or "").strip()
 
-        snippet = body[:400].rsplit(' ', 1)[0] + ('…' if len(body) > 400 else '')
+        if len(body) <= 400:
+            snippet = body
+        else:
+            # Find the first sentence-ending punctuation AT or AFTER char 400
+            match = re.search(r'[.!?]', body[400:])
+            if match:
+                snippet = body[:400 + match.start() + 1]
+            else:
+                snippet = body[:400].rsplit(' ', 1)[0] + '…' 
 
         filename = _GUTENBERG_CATALOG.get(row['book_id'])
 
@@ -604,7 +612,7 @@ async def read_book_content(
         return (
             f"Requested passage ({actual_length:,} chars) exceeds max_chars={max_chars:,}.\n"
             "Narrow end_char, or increase max_chars if you deliberately want a longer read.\n"
-            f"Story length (boilerplate excluded): {total_length:,} chars.\n"
+            f"Story length: {total_length:,} chars.\n"
             f"Tip: get_book_stats('{filename}') shows chapter offsets."
         )
 
