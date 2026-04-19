@@ -51,6 +51,16 @@ def create_table(conn):
     conn.commit()
     print("Table ready.")
 
+def create_meta_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS gutenberg_meta (
+            book_id   integer,
+            char_count integer
+        )
+    """)
+    conn.commit()
+
 def bulk_insert(conn, rows):
     if not rows:
         return
@@ -161,16 +171,19 @@ def _decode_raw_text(data, hint=None):
         encoding = "utf-8"
         
     try:
-        return data.decode(encoding)
+        text = data.decode(encoding)
     except (LookupError, UnicodeDecodeError):
         # Fallback sequence: UTF-8 -> ISO-8859-1 -> Replace
         try:
-            return data.decode("utf-8")
+            text = data.decode("utf-8")
         except UnicodeDecodeError:
             try:
-                return data.decode("iso-8859-1")
+                text = data.decode("iso-8859-1")
             except:
-                return data.decode("utf-8", errors="replace")
+                text = data.decode("utf-8", errors="replace")
+                
+    # Normalize newlines to prevent offset drift across OS/readers
+    return text.replace('\r\n', '\n').replace('\r', '\n')
 
 def _decode_zip(data):
     """Extract and decode the first .txt entry from a zip blob."""
@@ -212,24 +225,57 @@ def download_text(book_id):
 # ---------------------------------------------------------------------------
 
 def chunk_prose(text):
-    paras    = re.split(r'\n\s*\n', text)
-    chunks   =[]
-    buf      = ""
-    buf_start = 0
-    offset   = 0
-    for para in paras:
-        para = para.strip()
-        if not para:
-            offset += 2
-            continue
-        if len(buf) + len(para) > CHUNK_CHARS and buf:
-            chunks.append((buf.strip(), buf_start))
-            buf_start = offset
-            buf = ""
-        buf    += " " + para
-        offset += len(para) + 2
-    if buf.strip():
-        chunks.append((buf.strip(), buf_start))
+    """
+    Splits text into chunks of ~CHUNK_CHARS, preserving exact character offsets
+    into the original `text` string.
+
+    Key invariant: chunk_start_offset is always the exact index in `text` where
+    the first paragraph of that chunk begins — computed by summing part lengths,
+    never by calling str.find() (which can match the wrong occurrence of a
+    repeated phrase and cause offset drift).
+    """
+    # Split keeping the delimiters (odd-indexed elements) so we can measure them.
+    parts = re.split(r'(\n\s*\n)', text)
+    chunks = []
+
+    current_chunk = ""
+    chunk_start_offset = 0
+    raw_offset = 0
+
+    i = 0
+    while i < len(parts):
+        para_raw  = parts[i]
+        para_text = para_raw.strip()
+
+        # Offset of the first non-whitespace character of this paragraph in `text`.
+        leading_ws = len(para_raw) - len(para_raw.lstrip())
+        para_content_start = raw_offset + leading_ws
+
+        if para_text:
+            if not current_chunk:
+                chunk_start_offset = para_content_start
+
+            # Flush current chunk before it would exceed CHUNK_CHARS
+            if len(current_chunk) + len(para_text) > CHUNK_CHARS and current_chunk:
+                chunks.append((current_chunk, chunk_start_offset))
+                current_chunk = ""
+                chunk_start_offset = para_content_start
+
+            current_chunk += ("\n\n" if current_chunk else "") + para_text
+
+        # Advance by the exact length of this paragraph part
+        raw_offset += len(para_raw)
+
+        # Consume the following delimiter (odd index) if present
+        if i + 1 < len(parts):
+            raw_offset += len(parts[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    if current_chunk:
+        chunks.append((current_chunk, chunk_start_offset))
+
     return chunks
 
 def is_already_indexed(conn, book_id):
@@ -239,6 +285,33 @@ def is_already_indexed(conn, book_id):
         (book_id,)
     )
     return cur.fetchone()[0] > 0
+
+def get_indexed_char_count(conn, book_id):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT char_count FROM gutenberg_meta WHERE book_id = %s LIMIT 1",
+        (book_id,)
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+def delete_book_from_index(conn, book_id):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM gutenberg_paragraphs WHERE book_id = %s", (book_id,))
+    conn.commit()
+    cur.execute("DELETE FROM gutenberg_meta WHERE book_id = %s", (book_id,))
+    conn.commit()
+    print(f"    Deleted old index entries for book_id={book_id}.")
+
+def save_char_count(conn, book_id, char_count):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM gutenberg_meta WHERE book_id = %s", (book_id,))
+    conn.commit()
+    cur.execute(
+        "INSERT INTO gutenberg_meta (book_id, char_count) VALUES (%s, %s)",
+        (book_id, char_count)
+    )
+    conn.commit()
 
 # ---------------------------------------------------------------------------
 # Main
@@ -254,6 +327,7 @@ def main():
         raise
 
     create_table(conn)
+    create_meta_table(conn)
     os.makedirs(BOOKS_TXT_DIR, exist_ok=True)
 
     catalog = fetch_catalog(LANGUAGES)
@@ -315,8 +389,18 @@ def main():
         print(f"[{idx}/{len(catalog)}] #{book_id} — {title[:60]}")
 
         if os.path.exists(book_path) and is_already_indexed(conn, book_id):
-            print(f"    Already indexed, skipping.")
-            continue
+            # Check if the file on disk has changed since indexing (e.g. re-downloaded)
+            with open(book_path, encoding='utf-8', errors='replace') as f:
+                disk_content = f.read()
+            disk_char_count = len(disk_content)
+            stored_size = get_indexed_char_count(conn, book_id)
+            if abs(disk_char_count - stored_size) < 1000:  # within 1KB tolerance
+                print(f"    Already indexed and file unchanged, skipping.")
+                continue
+            else:
+                print(f"    File changed since indexing (disk={disk_char_count}, indexed≈{stored_size}), re-indexing.")
+                delete_book_from_index(conn, book_id)
+                raw = disk_content
         elif os.path.exists(book_path):
             print(f"    File exists, indexing from disk.")
             with open(book_path, encoding='utf-8', errors='replace') as f:
@@ -329,7 +413,9 @@ def main():
                 f.write(raw)
             print(f"    Saved: books/txt/{book_filename}")
             time.sleep(SLEEP_SEC)
-
+        
+        save_char_count(conn, book_id, len(raw))
+        
         if len(raw) < 200:
             print(f"    SKIPPED: text too short ({len(raw)} chars).")
             continue
