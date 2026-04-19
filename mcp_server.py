@@ -339,53 +339,6 @@ def _strip_gutenberg(text: str) -> tuple[str, int]:
     text = lstripped.rstrip()
 
     return text, strip_offset
-
-def _extract_centered_snippet(body: str, query_words: list[str], budget: int = 400) -> str:
-    body = body.strip()
-    if not body:
-        return ""
-
-    match_pos = len(body)
-    for word in query_words:
-        idx = body.lower().find(word.lower())
-        if idx != -1 and idx < match_pos:
-            match_pos = idx
-
-    half = budget // 2
-    if match_pos <= half:
-        start = 0
-    else:
-        lookback = body[max(0, match_pos - half): match_pos]
-        last_sent_end = None
-        for m in re.finditer(r'[.!?][\u201d\u2019"\']?\s+', lookback):
-            last_sent_end = m
-        if last_sent_end:
-            start = (match_pos - half) + last_sent_end.end()
-        else:
-            last_para = lookback.rfind('\n\n')
-            if last_para != -1:
-                start = (match_pos - half) + last_para + 2
-            else:
-                last_space = lookback.rfind(' ')
-                start = (match_pos - half) + (last_space + 1 if last_space != -1 else 0)
-
-    chunk = body[start: start + budget]
-
-    last_end = None
-    for m in re.finditer(r'[.!?][\u201d\u2019"\']?(?=\s|$)', chunk):
-        last_end = m
-
-    if last_end:
-        return chunk[:last_end.end()].strip()
-
-    extended = body[start: start + budget + 300]
-    last_end = None
-    for m in re.finditer(r'[.!?][\u201d\u2019"\']?(?=\s|$)', extended):
-        last_end = m
-    if last_end:
-        return extended[:last_end.end()].strip()
-
-    return chunk.strip()
  
 def _manticore_conn():
     return _pymysql.connect(
@@ -530,7 +483,7 @@ async def gutenberg_prose_search(
     for i, row in enumerate(rows, 1):
         body = (row.get("body") or "").strip()
 
-        snippet = _extract_centered_snippet(body, words, budget=400)
+        snippet = body[:400].rsplit(' ', 1)[0] + ('…' if len(body) > 400 else '')
 
         filename = _GUTENBERG_CATALOG.get(row['book_id'])
 
