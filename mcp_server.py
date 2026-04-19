@@ -563,27 +563,42 @@ async def gutenberg_prose_search(
     ]
  
     for i, row in enumerate(rows, 1):
-        # Replace [[ / ]] markers with ** for display
         body = (row.get("body") or "").strip()
 
-        if body and body[0].islower():
-            # Find first sentence end, accounting for quotes after period
-            first_dot = min(
-                (body.find(p) for p in (". ", '." ', ".' ", '.\u201d ', '.\u2019 ')
-                 if body.find(p) != -1),
-                default=-1
+        first_real = re.search(r'[^\s\u201c\u2018"\']', body)
+        if first_real and body[first_real.start()].islower():
+            # Pass 1: strict — sentence end followed by uppercase or opening quote
+            m = re.search(
+                r'[.!?][\u201d\u2019"\']?\s+(?=[A-Z\u201c\u2018"\'])',
+                body[:400],
             )
-            if first_dot != -1 and first_dot < 200:
-                # Skip past the punctuation and any quote character
-                skip = 2 if body[first_dot + 1] == " " else 3
-                body = body[first_dot + skip:]
-        # Truncate at last complete sentence within 500 chars
-        chunk = body[:500]
-        last_dot = chunk.rfind(". ")
-        if last_dot != -1:
-            snippet = chunk[:last_dot + 1]
+            # Pass 2
+            if not m:
+                m = re.search(
+                    r'[!?][\u201d\u2019"\']?\s+(?=\w)',
+                    body[:400],
+                )
+            if m:
+                body = body[m.end():]
+
+        BUDGET = 500
+        chunk = body[:BUDGET]
+
+        # Walk forward collecting every sentence-end position; keep the last one
+        # that still fits inside BUDGET so we get a full, clean closing sentence.
+        last_end = None
+        for m in re.finditer(r'[.!?][\u201d\u2019"\']?(?=\s|$)', chunk):
+            last_end = m
+
+        if last_end:
+            snippet = chunk[: last_end.end()].strip()
         else:
-            snippet = chunk
+            # Nothing ended inside the budget – extend a little further to find one.
+            extended = body[: BUDGET + 300]
+            last_end = None
+            for m in re.finditer(r'[.!?][\u201d\u2019"\']?(?=\s|$)', extended):
+                last_end = m
+            snippet = (extended[: last_end.end()].strip() if last_end else chunk.strip())
         
         # Try to get exact filename from catalog
         filename = _GUTENBERG_CATALOG.get(row['book_id'])
