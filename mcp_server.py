@@ -31,12 +31,28 @@ import re as _re
 
 # Load Gutenberg catalog once at startup (optional)
 _GUTENBERG_CATALOG = {}
+_GUTENBERG_AUTHORS = {}
+_GUTENBERG_CATEGORIES = {} 
 
 def sanitize_filename(s: str) -> str:
     """Match the filename sanitization logic used by the indexer."""
     s = re.sub(r'[<>:"/\\|?*]', '', s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s[:80]
+
+def _parse_author(raw: str) -> str:
+    """Take first author, strip dates, return clean name."""
+    first = raw.split(';')[0].strip()
+    return re.sub(r',\s*\d{4}-\d{0,4}$', '', first).strip()
+
+def _parse_categories(bookshelves: str) -> list:
+    """Extract Category:-prefixed entries and strip the prefix."""
+    cats = []
+    for entry in bookshelves.split(';'):
+        entry = entry.strip()
+        if entry.startswith('Category:'):
+            cats.append(entry[len('Category:'):].strip())
+    return cats
 
 def _load_gutenberg_catalog():
     """Load pg_catalog.csv into memory for fast book_id → filename lookups."""
@@ -73,6 +89,8 @@ def _load_gutenberg_catalog():
                 # Build filename in the exact same format as the indexer
                 filename = f"{author_sanitized} - {title_sanitized} ({lang}).txt"
                 _GUTENBERG_CATALOG[book_id] = filename
+                _GUTENBERG_AUTHORS[book_id] = _parse_author(author_raw)
+                _GUTENBERG_CATEGORIES[book_id] = _parse_categories(row.get('Bookshelves', ''))
 
         logging.info(f"Loaded {len(_GUTENBERG_CATALOG)} books from Gutenberg catalog")
     except Exception as e:
@@ -366,14 +384,15 @@ def date_time() -> str:
 # ---------------------------------------------------------------------------
 # LOCAL BOOK RETRIEVAL
 # ----------------------------------------------------------------------------
- 
 @mcp.tool()
-async def gutenberg_prose_search(
+async def gutenberg_search(
     query: str,
     language: str = "en",
     max_results: int = 10,
     offset: int = 0,
     proximity: int = 50,
+    author: str = None,
+    category: str = None,
 ) -> str:
     """
     Search the full prose text of all indexed Gutenberg books by concrete word clusters.
@@ -386,22 +405,24 @@ async def gutenberg_prose_search(
     Body text is weighted 10× higher than title text.
     The first result is therefore the strongest match; quality degrades toward the end.
 
-    Args:
-        query:       2-4 concrete words likely to appear near each other in prose.
-                     Use mid-sentence fragments, NOT abstract mood words.
-                     Good: "lamp brass shadow table" / "heart beat silence"
-                     Bad:  "dark atmospheric sensual"
+Args:
+        query:       Start with complete sentences, then simplify if no results appear.
         language:    Two-letter code. Default "en".
         max_results: Number of paragraphs to return per page (default 10).
         offset:      Zero-based index of the first result to return (default 0).
                      Use offset=10 to get results 11-20, offset=20 for 21-30, etc.
         proximity:   Max token distance between query words (default 50).
                      Increase to 100-200 if zero results with valid words.
+        author:      Optional. Filter by author name (case-insensitive partial match).
+                     e.g. "Dickens" or "Carroll". Matches against the first listed author.
+        category:    Optional. Filter by bookshelf category (case-insensitive partial match).
+                     e.g. "Historical Fiction" or "Philosophy". Matches against
+                     Category:-prefixed entries in the Bookshelves field.
 
     Workflow:
-        gutenberg_prose_search(query="...")                          ← first page
-        gutenberg_prose_search(query="...", offset=10)              ← next page
-        read_book_content(filename=..., start_char=...)
+        gutenberg_search(query="...")                          ← first page
+        gutenberg_search(query="...", offset=10)              ← next page
+        read_book_content(book_id=..., start_char=...)
     """
     clean_query = re.sub(r'[^\w\s]', '', query)
     words = [w.strip() for w in clean_query.split() if w.strip()]
@@ -454,21 +475,36 @@ async def gutenberg_prose_search(
         )
     except Exception as e:
         return f"Manticore query error: {type(e).__name__}: {e}"
+    
+    if author:
+        author_lower = author.lower()
+        rows = [r for r in rows if author_lower in _GUTENBERG_AUTHORS.get(r['book_id'], '').lower()]
+    if category:
+        category_lower = category.lower()
+        rows = [r for r in rows if any(category_lower in c.lower() for c in _GUTENBERG_CATEGORIES.get(r['book_id'], []))]
  
     if not rows:
+        filter_note = ""
+        if author or category:
+            parts = []
+            if author: parts.append(f"author='{author}'")
+            if category: parts.append(f"category='{category}'")
+            filter_note = f" with filters ({', '.join(parts)})"
         return (
-            f"No prose matches for '{query}' (language={language}, proximity={proximity}).\n\n"
+            f"No prose matches for '{query}'{filter_note} (language={language}, proximity={proximity}).\n\n"
             "Diagnosis:\n"
             "  1. Try fewer words — 2 is often better than 4.\n"
             "  2. Increase proximity= to 150 or 200.\n"
             "  3. Use words from the middle of sentences, not headings or dialogue tags.\n"
-            f"  4. Confirm language='{language}' is indexed."
+            f"  4. Confirm language='{language}' is indexed.\n"
+            "  5. If using author= or category=, try broadening or removing those filters."
         )
  
     fallback_note = (
-        f"\n⚠️  Proximity/{proximity} returned nothing — showing plain-match results "
-        "(words appear in same paragraph but further apart than the proximity window). "
-        "Consider increasing proximity= next time.\n"
+        f"\n⚠️  Proximity/{proximity} search returned 0 results — falling back to plain-match "
+        f"(all query words appear in these paragraphs, but may be far apart). "
+        f"The {len(rows)} results below are plain-match only. "
+        f"To get proximity-ranked results, try increasing proximity= to 150 or 200.\n"
         if used_fallback else ""
     )
  
@@ -495,21 +531,14 @@ async def gutenberg_prose_search(
         
         end_char = row['start_char'] + len(snippet)
 
-        filename = _GUTENBERG_CATALOG.get(row['book_id'])
-
-        if filename:
-            lines.append(
-                f"{i}. {row['title']} by {row['author']}\n"
-                f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
-                f"   filename: {filename}\n"
-                f"   Match: {snippet}\n\n"
-            )
-        else:
-            lines.append(
-                f"{i}. {row['title']} by {row['author']}\n"
-                f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
-                f"   Match: {snippet}\n\n"
-            )
+        cats = _GUTENBERG_CATEGORIES.get(row['book_id'], [])
+        cat_str = f"   categories: {', '.join(cats)}\n" if cats else ""
+        lines.append(
+            f"{i}. {row['title']} by {row['author']}\n"
+            f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
+            f"{cat_str}"
+            f"   Match: {snippet}\n\n"
+        )
 
     next_offset = offset + len(rows)
     prev_offset = max(0, offset - max_results)
@@ -517,20 +546,15 @@ async def gutenberg_prose_search(
     next_steps = ["\nNext steps:"]
     if next_offset < total_found:
         next_steps.append(
-            f"  • Continue  → gutenberg_prose_search(query='{query}', offset={next_offset}, max_results={max_results})"
+            f"  • Continue  → gutenberg_search(query='{query}', offset={next_offset}, max_results={max_results})"
         )
     if offset > 0:
         next_steps.append(
-            f"  • Go back   → gutenberg_prose_search(query='{query}', offset={prev_offset}, max_results={max_results})"
+            f"  • Go back   → gutenberg_search(query='{query}', offset={prev_offset}, max_results={max_results})"
         )
-    if _GUTENBERG_CATALOG:
-        next_steps.append(
-            "  • Read text → read_book_content(filename=<filename>, start_char=<start_char>)"
-        )
-    else:
-        next_steps.append(
-            "  • Read text → read_book_content(filename=<filename>, start_char=<start_char>)"
-        )
+    next_steps.append(
+        "  • Read text → read_book_content(book_id=<book_id>, start_char=<start_char>)"
+    )
     next_steps.append(
         f"  Total found: {total_found} | Currently showing: {first}–{last}"
     )
@@ -540,9 +564,9 @@ async def gutenberg_prose_search(
  
 @mcp.tool()
 async def read_book_content(
-    filename: str,
+    book_id: int = None,
+    filename: str = None,
     start_char: int = 0,
-    end_char: int = -1,
     max_chars: int = 5000,
 ) -> str:
     """
@@ -551,33 +575,42 @@ async def read_book_content(
     Gutenberg license text and boilerplate are automatically stripped —
     you will never receive license content regardless of start_char.
 
-    start_char and end_char are raw-file offsets, exactly as returned by
-    gutenberg_prose_search and get_book_stats. The tool handles translation
-    to story-content offsets internally.
+    start_char is a raw-file offset, exactly as returned by search_passages.
+    The tool handles translation to story-content offsets internally.
 
     Args:
-        filename:           Exact filename.
-        start_char:         Starting character position in the raw file (default 0).
-                            Use offsets directly from gutenberg_prose_search or
-                            get_book_stats chapter offsets.
-        end_char:           Ending position in the raw file. Default -1 = start + max_chars.
-        max_chars:          Maximum characters to return (default 3000).
-                            Set to 0 for no limit.
+        book_id:    Preferred. The numeric book_id from search_passages.
+        filename:   Fallback if book_id is unavailable. Must be the exact filename
+                    as returned by search_passages.
+        start_char: Starting character position in the raw file (default 0).
+                    Use offsets directly from search_passages.
+        max_chars:  Maximum characters to return (default 5000). Set to 0 for no limit.
 
     Returns: The passage with position metadata and a continue hint.
     """
+    if book_id is not None:
+        filename = _GUTENBERG_CATALOG.get(book_id)
+        if not filename:
+            return f"No book found for book_id={book_id}"
+    elif filename is None:
+        return "Provide either book_id or filename."
+
     books_dir = os.path.join(os.path.dirname(__file__), "gutenberg", "books", "txt")
     filepath  = os.path.join(books_dir, filename)
 
     if not os.path.exists(filepath):
+        import difflib
         available = (
             [f for f in os.listdir(books_dir) if f.endswith(".txt")]
             if os.path.exists(books_dir) else []
         )
-        hint = (
-            "\nAvailable books:\n" + "\n".join(f"  - {f}" for f in available[:5])
-            if available else ""
-        )
+        close = difflib.get_close_matches(filename, available, n=3, cutoff=0.5)
+        if close:
+            hint = "\nDid you mean:\n" + "\n".join(f"  - {f}" for f in close)
+        elif available:
+            hint = f"\n({len(available)} books available — no close matches found)"
+        else:
+            hint = ""
         return f"Book not found: {filename}{hint}"
 
     try:
@@ -589,10 +622,8 @@ async def read_book_content(
     content, strip_offset = _strip_gutenberg(raw)
     total_length = len(content)
 
-    # Clamp: if start_char is inside the header, begin at story start
-    raw_start   = max(start_char, strip_offset)
-    content_start = raw_start - strip_offset
-    content_start = max(0, min(content_start, total_length))
+    raw_start     = max(start_char, strip_offset)
+    content_start = max(0, min(raw_start - strip_offset, total_length))
 
     if content_start >= total_length:
         return (
@@ -601,41 +632,25 @@ async def read_book_content(
             "Use get_book_stats() to see actual story length and chapter offsets."
         )
 
-    # Resolve end
-    if end_char == -1 or end_char <= start_char:
-        content_end = content_start + (max_chars if max_chars > 0 else total_length)
-    else:
-        content_end = end_char - strip_offset
-    content_end = min(content_end, total_length)
-
+    content_end = min(
+        content_start + max_chars if max_chars > 0 else total_length,
+        total_length,
+    )
     actual_length = content_end - content_start
-
-    if max_chars > 0 and actual_length > max_chars:
-        return (
-            f"Requested passage ({actual_length:,} chars) exceeds max_chars={max_chars:,}.\n"
-            "Narrow end_char, or increase max_chars if you deliberately want a longer read.\n"
-            f"Story length: {total_length:,} chars.\n"
-            f"Tip: get_book_stats('{filename}') shows chapter offsets."
-        )
-
-    if content_start >= content_end:
-        return f"Invalid range after offset translation: [{content_start:,}, {content_end:,})"
-
     passage = content[content_start:content_end]
 
-    # Report positions as raw-file offsets so the LLM can pass them back unchanged
     reported_start = content_start + strip_offset
     reported_end   = content_end   + strip_offset
 
     return "\n".join([
-        f"Book: {filename}",
+        f"Book: {filename} (book_id={book_id})",
         f"Passage: raw file chars {reported_start}-{reported_end} ({actual_length} chars of story)",
         f"Story length: {total_length} chars",
         f"\n{'=' * 60}\n",
         passage,
         f"\n{'=' * 60}",
         f"End of passage (raw {reported_start}-{reported_end} of {total_length + strip_offset})",
-        f"To continue reading: read_book_content(filename='{filename}', start_char={reported_end})",
+        f"To continue reading: read_passage(book_id={book_id}, start_char={reported_end})",
     ])
 
 @mcp.tool()
@@ -646,7 +661,7 @@ async def gutenberg_debug_offsets(book_id: int, start_char: int) -> str:
     to find the exact delta between stored and actual offsets.
 
     Args:
-        book_id:    The numeric book_id from gutenberg_prose_search.
+        book_id:    The numeric book_id from gutenberg_search.
         start_char: The start_char offset from that same search result.
     """
     SEQ_LEN  = 60   # chars to use as the search probe
