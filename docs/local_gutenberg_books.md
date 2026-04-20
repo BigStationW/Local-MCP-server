@@ -23,7 +23,7 @@ This opens a console window running Manticore Search on `127.0.0.1:9306`.
 
 ## 3. Connecting to your LLM
 
-When both console windows (`Local-MCP-server\gutenberg\launch.ps1` and `Local-MCP-server\launch.bat`) are open and running, your LLM is now able to use specialized tools to interact with the database:
+When both console windows (**`Local-MCP-server\gutenberg\launch.ps1`** and **`Local-MCP-server\launch.bat`**) are open and running, your LLM is now able to use specialized tools to interact with the database:
 
 * **`gutenberg_search`** finds specific books and passages by searching with a set of keywords or full sentences. 
 
