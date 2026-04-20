@@ -457,7 +457,9 @@ async def gutenberg_search(
         end_char = row['start_char'] + len(snippet)
 
         bookshelves = (row.get('bookshelves') or '').strip()
-        cat_str = f"   categories: {bookshelves}\n" if bookshelves else ""
+        # Remove "Category: " prefix from each category entry
+        cleaned_bookshelves = re.sub(r'Category:\s*', '', bookshelves)
+        cat_str = f"   categories: {cleaned_bookshelves}\n" if cleaned_bookshelves else ""
         lines.append(
             f"{i}. {row['title']} by {row['author']}\n"
             f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
