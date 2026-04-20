@@ -6,7 +6,7 @@ This repository gives any tool-calling LLM (such as Gemma 4 or Qwen 3.5) the abi
 - Capture images of websites
 - Extract readable text from web pages
 - Grab images from the web
-- [Browse and fetch text from local Gutenberg books](https://github.com/BigStationW/Local-MCP-server/blob/main/docs/local_gutenberg_books.md)
+- [Browse and fetch text from local Gutenberg books (Only for Windows)](https://github.com/BigStationW/Local-MCP-server/blob/main/docs/local_gutenberg_books.md)
 
 ## Installation
 
