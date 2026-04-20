@@ -3,6 +3,23 @@ $host.UI.RawUI.WindowTitle = "Project Gutenberg - Download & Index"
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvDir    = Join-Path $ScriptDir "..\venv"
 
+# ============================================================
+# PHASE 0 - VALIDATE ENVIRONMENT
+# ============================================================
+# Check if the venv directory exists. If not, instruct the user to run the main batch file.
+if (-not (Test-Path $VenvDir)) {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host "  ERROR: PYTHON VIRTUAL ENVIRONMENT NOT FOUND" -ForegroundColor Red
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  The 'venv' directory is missing."
+    Write-Host "  Please run 'Local-MCP-server\launch.bat' first to create that folder."
+    Write-Host ""
+    Read-Host "  Press Enter to exit..."
+    exit
+}
+
 $BooksDir       = Join-Path $ScriptDir "books"
 
 $ManticoreDir  = Join-Path $ScriptDir "manticore"
@@ -133,8 +150,6 @@ if (-not (Test-Path $PythonExe)) {
     Read-Host "Press Enter to exit"
     exit 1
 }
-
-& $PythonExe -m pip install pymysql --quiet
 
 # ============================================================
 # PHASE 3 - RUN INDEXER
