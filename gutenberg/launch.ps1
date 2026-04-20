@@ -1,13 +1,31 @@
-$host.UI.RawUI.WindowTitle = "Gutenberg Prose Search - Running"
+$host.UI.RawUI.WindowTitle = "Project Gutenberg - Running"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$VenvDir    = Join-Path $ScriptDir "..\venv"
 $ManticoreDir = Join-Path $ScriptDir "manticore"
 $ManticoreBin = Join-Path $ManticoreDir "bin\searchd.exe"
 $ManticoreConf = Join-Path $ManticoreDir "manticore.conf"
 
+# ============================================================
+# PHASE 0 - VALIDATE ENVIRONMENT
+# ============================================================
+# Check if the venv directory exists. If not, instruct the user to run the main batch file.
+if (-not (Test-Path $VenvDir)) {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host "  ERROR: PYTHON VIRTUAL ENVIRONMENT NOT FOUND" -ForegroundColor Red
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  The 'venv' directory is missing."
+    Write-Host "  Please run 'Local-MCP-server\launch.bat' first to create that folder."
+    Write-Host ""
+    Read-Host "  Press Enter to exit..."
+    exit
+}
+
 Write-Host ""
 Write-Host "============================================================"
-Write-Host " GUTENBERG PROSE SEARCH - LAUNCH"
+Write-Host " PROJECT GUTENBERG - RUNNING"
 Write-Host "============================================================"
 Write-Host ""
 
