@@ -54,6 +54,7 @@ def create_table(conn):
             title text,
             author text,
             language string,
+            bookshelves string,
             start_char integer,
             body text
         ) morphology='stem_en,libstemmer_fr,libstemmer_de,libstemmer_it,libstemmer_es'
@@ -68,8 +69,8 @@ def bulk_insert(conn, rows):
         return
     cur = conn.cursor()
     sql = ("INSERT INTO gutenberg_paragraphs "
-           "(book_id,title,author,language,start_char,body) "
-           "VALUES (%s,%s,%s,%s,%s,%s)")
+           "(book_id,title,author,language,bookshelves,start_char,body) "
+           "VALUES (%s,%s,%s,%s,%s,%s,%s)")
     cur.executemany(sql, rows)
     conn.commit()
 
@@ -317,6 +318,7 @@ def main():
         title = row.get('Title', 'Unknown').strip() or 'Unknown'
         author = row.get('Authors', 'Unknown').strip() or 'Unknown'
         lang = row.get('Language', '').strip().lower()
+        bookshelves = row.get('Bookshelves', '').strip()
 
         if not book_id:
             continue
@@ -343,7 +345,7 @@ def main():
             continue
 
         for chunk_text, start_char in chunks:
-            batch.append((book_id, title, author, lang, start_char, chunk_text))
+            batch.append((book_id, title, author, lang, bookshelves, start_char, chunk_text))
             if len(batch) >= BATCH_SIZE:
                 bulk_insert(conn, batch)
                 total += len(batch)
