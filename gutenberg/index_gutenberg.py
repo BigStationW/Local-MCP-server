@@ -48,7 +48,7 @@ def normalize_unicode_punctuation(text):
 # MANTICORE SETUP  (replaces download_books.ps1 logic)
 # ============================================================
 
-def setup_manticore():
+def setup_manticore(verbose=True):
     """
     Full setup flow that was previously in the .ps1:
       - Create directories
@@ -60,15 +60,16 @@ def setup_manticore():
       - Register cleanup so searchd dies when this process exits
     Returns the searchd Popen object.
     """
-    print()
-    print("============================================================")
-    print("  PROJECT GUTENBERG - DOWNLOAD & INDEX")
-    print("============================================================")
-    print()
-    print("  Please wait while the environment is prepared...")
-    print()
-    print("  Setting up Manticore Search...")
-    print()
+    if verbose:
+        print()
+        print("============================================================")
+        print("  PROJECT GUTENBERG - DOWNLOAD & INDEX")
+        print("============================================================")
+        print()
+        print("  Please wait while the environment is prepared...")
+        print()
+        print("  Setting up Manticore Search...")
+        print()
 
     # --- Directories ---
     for d in [MANTICORE_DIR, BOOKS_BASE_DIR, MANTICORE_LOGS]:
@@ -76,7 +77,8 @@ def setup_manticore():
 
     # --- Download Manticore if needed ---
     if os.path.exists(MANTICORE_BIN):
-        print("  Manticore binary already found, skipping download.")
+        if verbose:
+            print("  Manticore binary already found, skipping download.")
     else:
         _download_manticore()
 
@@ -105,7 +107,8 @@ def setup_manticore():
     atexit.register(_cleanup)
 
     # --- Wait for port 9306 ---
-    print("  Waiting for Manticore to be ready...")
+    if verbose:
+        print("  Waiting for Manticore to be ready...")
     ready = False
     for _ in range(30):
         time.sleep(1)
@@ -121,9 +124,10 @@ def setup_manticore():
         input("  Press Enter to exit...")
         sys.exit(1)
 
-    print()
-    print("  [OK] Environment ready.")
-    print()
+    if verbose:
+        print()
+        print("  [OK] Environment ready.")
+        print()
 
     return searchd_proc
 
@@ -493,13 +497,7 @@ def main():
 
     if args.serve:
         # Just start Manticore and keep it running (for launch_gutenberg.bat)
-        print()
-        print("============================================================")
-        print("  PROJECT GUTENBERG - STARTING MANTICORE")
-        print("============================================================")
-        print()
-        
-        searchd_proc = setup_manticore()
+        searchd_proc = setup_manticore(verbose=False)
         
         print("============================================================")
         print("  MANTICORE SEARCH IS RUNNING")
@@ -507,9 +505,6 @@ def main():
         print()
         print(f"  Listening on {MANTICORE_HOST}:{MANTICORE_PORT}")
         print("  Keep this window open while using the MCP tools.")
-        print()
-        print("  Press Ctrl+C or close this window to stop.")
-        print()
         
         try:
             # Keep alive until interrupted
