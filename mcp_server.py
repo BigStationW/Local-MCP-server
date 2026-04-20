@@ -30,15 +30,10 @@ import os as _os
 import re as _re
 
 # Load Gutenberg catalog once at startup (optional)
-_GUTENBERG_CATALOG = {}
 _GUTENBERG_AUTHORS = {}
 _GUTENBERG_CATEGORIES = {} 
-
-def sanitize_filename(s: str) -> str:
-    """Match the filename sanitization logic used by the indexer."""
-    s = re.sub(r'[<>:"/\\|?*]', '', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s[:80]
+_GUTENBERG_TITLES = {}
+_GUTENBERG_LANGUAGES = {}
 
 def _parse_author(raw: str) -> str:
     """Take first author, strip dates, return clean name."""
@@ -55,11 +50,11 @@ def _parse_categories(bookshelves: str) -> list:
     return cats
 
 def _load_gutenberg_catalog():
-    """Load pg_catalog.csv into memory for fast book_id → filename lookups."""
-    global _GUTENBERG_CATALOG
-    if _GUTENBERG_CATALOG:
+    """Load pg_catalog.csv into memory for fast lookups."""
+    global _GUTENBERG_AUTHORS
+    if _GUTENBERG_AUTHORS:
         return
-    
+        
     catalog_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "gutenberg", "books", "pg_catalog.csv"
@@ -78,21 +73,16 @@ def _load_gutenberg_catalog():
                 if not book_id:
                     continue
                 
-                # Use robust .get() calls and sanitization identical to indexer
                 author_raw = row.get('Authors', 'Unknown').strip() or 'Unknown'
                 title_raw = row.get('Title', 'Unknown').strip() or 'Unknown'
                 lang = row.get('Language', '').strip().lower()
 
-                author_sanitized = sanitize_filename(author_raw)
-                title_sanitized = sanitize_filename(title_raw)
-                
-                # Build filename in the exact same format as the indexer
-                filename = f"{author_sanitized} - {title_sanitized} ({lang}).txt"
-                _GUTENBERG_CATALOG[book_id] = filename
                 _GUTENBERG_AUTHORS[book_id] = _parse_author(author_raw)
                 _GUTENBERG_CATEGORIES[book_id] = _parse_categories(row.get('Bookshelves', ''))
+                _GUTENBERG_TITLES[book_id] = title_raw
+                _GUTENBERG_LANGUAGES[book_id] = lang
 
-        logging.info(f"Loaded {len(_GUTENBERG_CATALOG)} books from Gutenberg catalog")
+        logging.info(f"Loaded {len(_GUTENBERG_AUTHORS)} books from Gutenberg catalog")
     except Exception as e:
         logging.warning(f"Could not load Gutenberg catalog: {e}")
 
@@ -396,7 +386,7 @@ async def gutenberg_search(
 ) -> str:
     """
     Search the full prose text of all indexed Gutenberg books by concrete word clusters.
-    Returns highlighted paragraphs with book IDs, filenames, and start_char offsets
+    Returns highlighted paragraphs with book IDs, and start_char offsets
     ready to pass directly to read_book_content.
 
     Results are ranked by proximity_bm25: a combined score of
@@ -564,335 +554,59 @@ Args:
  
 @mcp.tool()
 async def read_book_content(
-    book_id: int = None,
-    filename: str = None,
+    book_id: int,
     start_char: int = 0,
     max_chars: int = 5000,
 ) -> str:
     """
-    Read a passage from a Gutenberg book.
-
-    Gutenberg license text and boilerplate are automatically stripped —
-    you will never receive license content regardless of start_char.
-
-    start_char is a raw-file offset, exactly as returned by search_passages.
-    The tool handles translation to story-content offsets internally.
-
-    Args:
-        book_id:    Preferred. The numeric book_id from search_passages.
-        filename:   Fallback if book_id is unavailable. Must be the exact filename
-                    as returned by search_passages.
-        start_char: Starting character position in the raw file (default 0).
-                    Use offsets directly from search_passages.
-        max_chars:  Maximum characters to return (default 5000). Set to 0 for no limit.
-
-    Returns: The passage with position metadata and a continue hint.
-    """
-    if book_id is not None:
-        filename = _GUTENBERG_CATALOG.get(book_id)
-        if not filename:
-            return f"No book found for book_id={book_id}"
-    elif filename is None:
-        return "Provide either book_id or filename."
-
-    books_dir = os.path.join(os.path.dirname(__file__), "gutenberg", "books", "txt")
-    filepath  = os.path.join(books_dir, filename)
-
-    if not os.path.exists(filepath):
-        import difflib
-        available = (
-            [f for f in os.listdir(books_dir) if f.endswith(".txt")]
-            if os.path.exists(books_dir) else []
-        )
-        close = difflib.get_close_matches(filename, available, n=3, cutoff=0.5)
-        if close:
-            hint = "\nDid you mean:\n" + "\n".join(f"  - {f}" for f in close)
-        elif available:
-            hint = f"\n({len(available)} books available — no close matches found)"
-        else:
-            hint = ""
-        return f"Book not found: {filename}{hint}"
-
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            raw = f.read()
-    except Exception as e:
-        return f"Error reading book: {type(e).__name__}: {e}"
-
-    content, strip_offset = _strip_gutenberg(raw)
-    total_length = len(content)
-
-    raw_start     = max(start_char, strip_offset)
-    content_start = max(0, min(raw_start - strip_offset, total_length))
-
-    if content_start >= total_length:
-        return (
-            f"start_char={start_char:,} is beyond the end of the story "
-            f"({total_length:,} story chars, header is {strip_offset:,} chars).\n"
-            "Use get_book_stats() to see actual story length and chapter offsets."
-        )
-
-    content_end = min(
-        content_start + max_chars if max_chars > 0 else total_length,
-        total_length,
-    )
-    actual_length = content_end - content_start
-    passage = content[content_start:content_end]
-
-    reported_start = content_start + strip_offset
-    reported_end   = content_end   + strip_offset
-
-    return "\n".join([
-        f"Book: {filename} (book_id={book_id})",
-        f"Passage: raw file chars {reported_start}-{reported_end} ({actual_length} chars of story)",
-        f"Story length: {total_length} chars",
-        f"\n{'=' * 60}\n",
-        passage,
-        f"\n{'=' * 60}",
-        f"End of passage (raw {reported_start}-{reported_end} of {total_length + strip_offset})",
-        f"To continue reading: read_passage(book_id={book_id}, start_char={reported_end})",
-    ])
-
-@mcp.tool()
-async def gutenberg_debug_offsets(book_id: int, start_char: int) -> str:
-    """
-    Debug tool: Compares text from the search index vs. the raw file.
-    Tests multiple offset hypotheses and does a direct substring search
-    to find the exact delta between stored and actual offsets.
+    Read a passage from a Gutenberg book using the local index.
 
     Args:
         book_id:    The numeric book_id from gutenberg_search.
-        start_char: The start_char offset from that same search result.
+        start_char: Starting character position as returned by gutenberg_search (default 0).
+        max_chars:  Maximum characters to return (default 5000). Set to 0 for no limit.
     """
-    SEQ_LEN  = 60   # chars to use as the search probe
-    SHOW_LEN = 200  # chars to show per candidate
+    title = _GUTENBERG_TITLES.get(book_id, "Unknown")
+    author = _GUTENBERG_AUTHORS.get(book_id, "Unknown")
+    lang = _GUTENBERG_LANGUAGES.get(book_id, "Unknown")
 
-    lines = [f"=== Gutenberg Offset Debug: book_id={book_id}, start_char={start_char:,} ===\n"]
-
-    # ── 1. Pull the indexed paragraph body ────────────────────────────────────
-    indexed_text = ""
     try:
         conn = _manticore_conn()
-        cur  = conn.cursor(_pymysql.cursors.DictCursor)
+        cur = conn.cursor(_pymysql.cursors.DictCursor)
         cur.execute(
             "SELECT body, start_char FROM gutenberg_paragraphs "
-            "WHERE book_id = %s AND start_char = %s LIMIT 1",
-            (book_id, start_char),
+            "WHERE book_id = %s AND start_char >= %s "
+            "ORDER BY start_char ASC "
+            "LIMIT 50",
+            (book_id, start_char)
         )
-        row = cur.fetchone()
-
-        # Also grab the paragraph just before and just after for context
-        cur.execute(
-            "SELECT start_char, body FROM gutenberg_paragraphs "
-            "WHERE book_id = %s AND start_char < %s ORDER BY start_char DESC LIMIT 1",
-            (book_id, start_char),
-        )
-        row_prev = cur.fetchone()
-
-        cur.execute(
-            "SELECT start_char, body FROM gutenberg_paragraphs "
-            "WHERE book_id = %s AND start_char > %s ORDER BY start_char ASC LIMIT 1",
-            (book_id, start_char),
-        )
-        row_next = cur.fetchone()
-
+        rows = cur.fetchall()
         conn.close()
-        indexed_text = row["body"] if row else ""
     except Exception as e:
-        lines.append(f"❌ Index query error: {type(e).__name__}: {e}")
-        return "\n".join(lines)
+        return f"Database error: {type(e).__name__}: {e}"
 
-    if not indexed_text:
-        # Exact match failed — fall back to the nearest neighbour so the probe
-        # search and file-offset analysis can still run and diagnose the drift.
-        fallback_row = None
-        fallback_label = ""
-        if row_next:
-            fallback_row   = row_next
-            fallback_label = f"next paragraph (start_char={row_next['start_char']:,})"
-        elif row_prev:
-            fallback_row   = row_prev
-            fallback_label = f"previous paragraph (start_char={row_prev['start_char']:,})"
+    if not rows:
+        return f"No content found for book_id={book_id} at start_char={start_char}."
 
-        if fallback_row:
-            lines.append(
-                f"⚠️  No paragraph at exact start_char={start_char:,} for book_id={book_id}.\n"
-                f"   Using {fallback_label} as probe source for offset analysis.\n"
-                f"   (This is expected if the offset came from 'To continue reading' or a chapter heading.)\n"
-            )
-            indexed_text = fallback_row["body"]
-            start_char = fallback_row["start_char"]
-        else:
-            lines.append(
-                f"❌ No paragraphs found at all for book_id={book_id}.\n"
-                "   The book may not be indexed."
-            )
-            return "\n".join(lines)
+    passage = ""
+    next_start = rows[-1]["start_char"] + len(rows[-1]["body"])
+    for row in rows:
+        chunk = row["body"]
+        if max_chars > 0 and len(passage) + len(chunk) > max_chars:
+            passage += chunk[:max_chars - len(passage)]
+            next_start = row["start_char"] + len(chunk)
+            break
+        passage += chunk + "\n\n"
+        next_start = row["start_char"] + len(chunk)
 
-    lines.append(f"[INDEX] Paragraph at start_char={start_char:,}:")
-    lines.append(f"  '{indexed_text[:SHOW_LEN]}…'")
-    if row_prev:
-        lines.append(f"\n[INDEX] Previous paragraph (start_char={row_prev['start_char']:,}):")
-        lines.append(f"  '{row_prev['body'][:100]}…'")
-    if row_next:
-        lines.append(f"\n[INDEX] Next paragraph (start_char={row_next['start_char']:,}):")
-        lines.append(f"  '{row_next['body'][:100]}…'")
-
-    # ── 2. Load the raw file ───────────────────────────────────────────────────
-    filename = _GUTENBERG_CATALOG.get(book_id)
-    if not filename:
-        lines.append(f"\n❌ book_id={book_id} not found in loaded catalog.")
-        return "\n".join(lines)
-
-    books_dir = os.path.join(os.path.dirname(__file__), "gutenberg", "books", "txt")
-    filepath  = os.path.join(books_dir, filename)
-
-    if not os.path.exists(filepath):
-        lines.append(f"\n❌ File not found on disk: {filename}")
-        return "\n".join(lines)
-
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            raw = f.read()
-    except Exception as e:
-        lines.append(f"\n❌ File read error: {type(e).__name__}: {e}")
-        return "\n".join(lines)
-
-    raw_len = len(raw)
-
-    # Strip boilerplate and record the strip offset
-    stripped_content, strip_offset = _strip_gutenberg(raw)
-    stripped_len = len(stripped_content)
-
-    lines.append(f"\n[FILE]  '{filename}'")
-    lines.append(f"  Raw file length  : {raw_len:,} chars")
-    lines.append(f"  Strip offset     : {strip_offset:,} chars  (header/boilerplate removed from front)")
-    lines.append(f"  Stripped length  : {stripped_len:,} chars")
-
-    # ── 3. Test the four plausible offset interpretations ─────────────────────
-    lines.append(f"\n[HYPOTHESIS TEST] Reading {SHOW_LEN} chars at four candidate positions:\n")
-
-    def read_at(text: str, pos: int, label: str) -> str:
-        if pos < 0 or pos >= len(text):
-            return f"  {label}: ❌ out of range (pos={pos:,}, text_len={len(text):,})"
-        snippet = text[pos : pos + SHOW_LEN].replace("\n", "↵")
-        return f"  {label} (pos={pos:,}):\n    '{snippet}'"
-
-    # H1: start_char is a raw-file offset  → read raw directly
-    lines.append(read_at(raw,             start_char,               "H1  raw[start_char]         "))
-    # H2: start_char is a stripped offset → translate to raw by adding strip_offset
-    lines.append(read_at(raw,             start_char + strip_offset,"H2  raw[start_char+strip]   "))
-    # H3: start_char is a raw offset  → read from stripped view (subtract strip_offset)
-    lines.append(read_at(stripped_content, start_char - strip_offset,"H3  stripped[start_char-strip]"))
-    # H4: start_char is already a stripped offset → read stripped directly
-    lines.append(read_at(stripped_content, start_char,               "H4  stripped[start_char]    "))
-
-    # ── 4. Direct substring search — find the truth ───────────────────────────
-    probe = indexed_text[:SEQ_LEN].strip()
-    # Normalise whitespace in probe (indexers often collapse whitespace)
-    probe_norm = _re.sub(r'\s+', ' ', probe)
-
-    lines.append(f"\n[SEARCH] Hunting for first {SEQ_LEN} chars of indexed text in the file…")
-    lines.append(f"  Probe (raw)  : '{probe}'")
-    lines.append(f"  Probe (norm) : '{probe_norm}'")
-
-    # Search in raw file (exact)
-    found_raw_exact = raw.find(probe)
-    # Search in raw file (whitespace-normalised)
-    raw_norm = _re.sub(r'\s+', ' ', raw)
-    found_raw_norm = raw_norm.find(probe_norm)
-    # Search in stripped content (exact)
-    found_strip_exact = stripped_content.find(probe)
-    # Search in stripped content (whitespace-normalised)
-    strip_norm = _re.sub(r'\s+', ' ', stripped_content)
-    found_strip_norm = strip_norm.find(probe_norm)
-
-    def delta(found: int, expected: int) -> str:
-        if found == -1:
-            return "NOT FOUND"
-        d = found - expected
-        sign = "+" if d >= 0 else ""
-        return f"found at {found:,}  (delta vs stored: {sign}{d:,})"
-
-    lines.append(f"\n  In raw file   (exact)         : {delta(found_raw_exact,   start_char)}")
-    lines.append(f"  In raw file   (ws-normalised) : {delta(found_raw_norm,    start_char)}")
-    lines.append(f"  In stripped   (exact)         : {delta(found_strip_exact, start_char)}")
-    lines.append(f"  In stripped   (ws-normalised) : {delta(found_strip_norm,  start_char)}")
-
-    # ── 5. Diagnosis ──────────────────────────────────────────────────────────
-    lines.append("\n[DIAGNOSIS]")
-
-    if found_raw_exact == start_char:
-        lines.append("✅ PERFECT MATCH: start_char is a raw-file offset (exact). No bug.")
-    elif found_strip_exact == start_char:
-        lines.append(
-            "✅ start_char is a STRIPPED-CONTENT offset (exact).\n"
-            "   → read_book_content already subtracts strip_offset, so this is correct.\n"
-            "   → But the debug tool's f.seek() was reading the RAW file — that's why it looked wrong.\n"
-            "   → No real bug; the debug tool's raw seek was misleading you."
-        )
-    elif found_raw_exact != -1:
-        # Exact match in the raw file but at a different position — the clearest signal.
-        # Must be checked BEFORE the ws-normalised branches: ws-normalised search will
-        # also find the text (just at a different position), so letting it fire first
-        # produces a misleading "whitespace-normalised indexer" diagnosis.
-        d = found_raw_exact - start_char
-        lines.append(
-            f"⚠️  Exact text found in RAW file at {found_raw_exact:,} (expected {start_char:,}).\n"
-            f"   Delta = {d:+,} chars.\n"
-            f"   → The stored start_char is off by exactly {d:+,} chars from the true raw-file position.\n"
-            f"   → Most likely cause: newline encoding differences (\\r\\n vs \\n) between the downloaded text\n"
-            f"     and how python reads the file later. Fix index_gutenberg.py to strip \\r before indexing.\n"
-            f"   → Re-index the affected books after applying the fix."
-        )
-    elif found_strip_exact != -1:
-        d = found_strip_exact - start_char
-        lines.append(
-            f"⚠️  Exact text found in STRIPPED content at {found_strip_exact:,} (expected {start_char:,}).\n"
-            f"   Delta = {d:+,} chars.\n"
-            f"   → strip_offset = {strip_offset:,}; the raw-file position would be {found_strip_exact + strip_offset:,}.\n"
-            f"   → Check whether the indexer added or subtracted strip_offset when writing start_char."
-        )
-    elif found_raw_norm != -1:
-        d = found_raw_norm - start_char
-        lines.append(
-            f"⚠️  Text NOT found at an exact position; closest match is in the RAW file after\n"
-            f"   whitespace-normalisation at offset {found_raw_norm:,}.\n"
-            f"   Delta = {d:+,} chars.\n"
-            f"   → The indexer likely stored offsets from a WHITESPACE-NORMALISED version of the raw file.\n"
-            f"   → Every offset drifts by roughly this amount; the drift grows with distance from start.\n"
-            f"   → Fix: re-index storing offsets from the ORIGINAL raw file, OR adjust read_book_content\n"
-            f"     to re-normalise whitespace before seeking."
-        )
-    elif found_strip_norm != -1:
-        d = found_strip_norm - start_char
-        lines.append(
-            f"⚠️  Text NOT found at an exact position; closest match is in the STRIPPED content after\n"
-            f"   whitespace-normalisation at offset {found_strip_norm:,}.\n"
-            f"   Delta = {d:+,} chars.\n"
-            f"   → The indexer stored offsets from a whitespace-normalised STRIPPED version.\n"
-            f"   → read_book_content must (a) strip boilerplate, then (b) normalise whitespace\n"
-            f"     before applying start_char, OR the indexer must store raw-file offsets."
-        )
-    else:
-        lines.append(
-            "❌ Text NOT FOUND anywhere in the file (exact or ws-normalised).\n"
-            "   Possible causes:\n"
-            "   • The file on disk has been modified/replaced since indexing.\n"
-            "   • The indexer used a different encoding or normalisation pass (e.g., NFC→NFD, ligatures).\n"
-            "   • The Gutenberg catalog points to the wrong file for this book_id.\n"
-            f"   Catalog filename : {filename}\n"
-            f"   First 200 chars of stripped content:\n   '{stripped_content[:200]}'"
-        )
-
-    # ── 6. Quick strip_offset sanity check ────────────────────────────────────
-    lines.append(f"\n[STRIP SANITY]  First 120 chars after strip_offset ({strip_offset:,}):")
-    lines.append(f"  '{raw[strip_offset : strip_offset + 120].replace(chr(10), '↵')}'")
-    lines.append(f"\n[STRIP SANITY]  First 120 chars of stripped_content:")
-    lines.append(f"  '{stripped_content[:120].replace(chr(10), '↵')}'")
-    lines.append("  (These two should be identical — if not, _strip_gutenberg has a bug.)")
-
-    return "\n".join(lines)
+    return "\n".join([
+        f"Book: {title} by {author} (book_id={book_id}, language={lang})",
+        f"Passage starting at char {start_char} ({len(passage.strip())} chars returned)",
+        f"\n{'=' * 60}\n",
+        passage.strip(),
+        f"\n{'=' * 60}",
+        f"To continue reading: read_book_content(book_id={book_id}, start_char={next_start})",
+    ])
 
 # ---------------------------------------------------------------------------
 # HTTP / WEB TOOLS
