@@ -289,6 +289,54 @@ def bulk_insert(conn, rows):
     cur.executemany(sql, rows)
     conn.commit()
 
+def sync_metadata_if_changed(conn, book_id, new_title, new_author, new_bookshelves):
+    """
+    Checks if a book's metadata has changed and updates it if necessary.
+    Returns True if the book was found (and updated or was already correct), 
+    False if the book is not in the index yet.
+    """
+    cur = conn.cursor(pymysql.cursors.DictCursor) # Use a DictCursor for easy column access
+    
+    # Fetch one row for the given book_id to check its current metadata
+    cur.execute(
+        "SELECT title, author, bookshelves FROM gutenberg_paragraphs WHERE book_id = %s LIMIT 1",
+        (book_id,)
+    )
+    
+    result = cur.fetchone()
+    
+    # Case 1: Book is not in the index at all.
+    if not result:
+        return False
+
+    # Case 2: Book exists. Compare its metadata with the new catalog data.
+    # Note: Manticore may return bytes, so we decode for a safe comparison.
+    current_title = result['title']
+    current_author = result['author']
+    current_bookshelves = result['bookshelves']
+    
+    if (current_title != new_title or 
+        current_author != new_author or 
+        current_bookshelves != new_bookshelves):
+        
+        print("    Metadata has changed. Updating...")
+        
+        # Use a normal cursor for the UPDATE command
+        update_cur = conn.cursor()
+        update_cur.execute(
+            """
+            UPDATE gutenberg_paragraphs 
+            SET title=%s, author=%s, bookshelves=%s 
+            WHERE book_id=%s
+            """,
+            (new_title, new_author, new_bookshelves, book_id)
+        )
+        conn.commit()
+        print("    [OK] Updated.")
+
+    # The book exists, so we don't need to re-download its text content.
+    return True
+
 # ============================================================
 # CATALOG
 # ============================================================
@@ -298,9 +346,16 @@ def load_catalog_bytes():
     catalog_path = os.path.join(BOOKS_BASE_DIR, "pg_catalog.csv")
 
     if os.path.exists(catalog_path):
-        print(f"  Using cached catalog: {catalog_path}")
-        with open(catalog_path, 'rb') as f:
-            return f.read()
+        # Check how old the file is (in seconds)
+        file_age_seconds = time.time() - os.path.getmtime(catalog_path)
+        
+        # 86400 seconds = 24 hours
+        if file_age_seconds < 86400:
+            print(f"  Using cached catalog (less than 24h old): {catalog_path}")
+            with open(catalog_path, 'rb') as f:
+                return f.read()
+        else:
+            print(f"  Cached catalog is older than 24 hours. Updating...")
 
     print(f"  Downloading catalog from {CATALOG_URL} ...")
     hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
@@ -320,7 +375,6 @@ def load_catalog_bytes():
 
     print(f"  Catalog saved to {catalog_path}")
     return csv_bytes
-
 
 def parse_and_filter_catalog(csv_bytes, wanted_langs):
     reader = csv.DictReader(io.StringIO(csv_bytes.decode('utf-8', errors='replace')))
@@ -647,15 +701,17 @@ def main():
         title = row.get('Title', 'Unknown').strip() or 'Unknown'
         author = row.get('Authors', 'Unknown').strip() or 'Unknown'
         lang = row.get('Language', '').strip().lower()
-        bookshelves = row.get('Bookshelves', '').strip()
+        raw_bookshelves = row.get('Bookshelves', '').strip()
+        bookshelves = re.sub(r'Category:\s*', '', raw_bookshelves, flags=re.IGNORECASE)
 
         if not book_id:
             continue
-
+        
         print(f"[{idx}/{len(catalog)}] #{book_id} — {title[:60]}")
 
-        if is_already_indexed(conn, book_id):
-            print("    Already indexed, skipping.")
+        book_exists = sync_metadata_if_changed(conn, book_id, title, author, bookshelves)
+        if book_exists:
+            print("    Already indexed, skipping text download.")
             continue
 
         raw = download_text(book_id)
