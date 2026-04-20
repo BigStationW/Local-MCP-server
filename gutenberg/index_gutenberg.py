@@ -1,4 +1,8 @@
 import re, time, io, zipfile, gzip, csv, urllib.request, sys, ssl, os
+import subprocess
+import socket
+import shutil
+import argparse
 import pymysql
 
 CHUNK_CHARS = 600
@@ -11,33 +15,241 @@ MANTICORE_PORT = 9306
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BOOKS_BASE_DIR = os.path.join(SCRIPT_DIR, "books")
 
-# Catalog URL — single ~14 MB gzipped CSV
+MANTICORE_DIR  = os.path.join(SCRIPT_DIR, "manticore")
+MANTICORE_BIN  = os.path.join(MANTICORE_DIR, "bin", "searchd.exe")
+MANTICORE_CONF = os.path.join(MANTICORE_DIR, "manticore.conf")
+MANTICORE_LOGS = os.path.join(MANTICORE_DIR, "logs")
+MANTICORE_ZIP  = os.path.join(SCRIPT_DIR, "manticore_pkg.zip")
+MANTICORE_URL  = (
+    "https://repo.manticoresearch.com/repository/manticoresearch_windows"
+    "/release/x64/manticore-25.0.0-26032712-ce3c27828-x64-bundle.zip"
+)
+
 CATALOG_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
 
-# Unicode normalization
-UNICODE_REPLACEMENTS =[
-    ('\u2019', "'"),
-    ('\u2018', "'"),
-    ('\u02bc', "'"),
-    ('\u0060', "'"),
-    ('\u00b4', "'"),
-    ('\u201c', '"'),
-    ('\u201d', '"'),
-    ('\u201e', '"'),
-    ('\u2014', ' -- '),
-    ('\u2013', '-'),
-    ('\u2011', '-'),
-    ('\u00ad', ''),
-    ('\u200b', ''),
-    ('\ufeff', ''),
+UNICODE_REPLACEMENTS = [
+    ('\u2019', "'"), ('\u2018', "'"), ('\u02bc', "'"),
+    ('\u0060', "'"), ('\u00b4', "'"), ('\u201c', '"'),
+    ('\u201d', '"'), ('\u201e', '"'), ('\u2014', ' -- '),
+    ('\u2013', '-'), ('\u2011', '-'), ('\u00ad', ''),
+    ('\u200b', ''), ('\ufeff', ''),
 ]
+
+# ============================================================
+# UNICODE
+# ============================================================
 
 def normalize_unicode_punctuation(text):
     for src, dst in UNICODE_REPLACEMENTS:
         text = text.replace(src, dst)
     return text
 
-# Helpers
+# ============================================================
+# MANTICORE SETUP  (replaces download_books.ps1 logic)
+# ============================================================
+
+def setup_manticore():
+    """
+    Full setup flow that was previously in the .ps1:
+      - Create directories
+      - Download and extract Manticore if missing
+      - Write manticore.conf
+      - Kill any stale searchd
+      - Start searchd in background
+      - Wait until port 9306 is ready
+      - Register cleanup so searchd dies when this process exits
+    Returns the searchd Popen object.
+    """
+    print()
+    print("============================================================")
+    print("  PROJECT GUTENBERG - DOWNLOAD & INDEX")
+    print("============================================================")
+    print()
+    print("  Please wait while the environment is prepared...")
+    print()
+    print("  Setting up Manticore Search...")
+    print()
+
+    # --- Directories ---
+    for d in [MANTICORE_DIR, BOOKS_BASE_DIR, MANTICORE_LOGS]:
+        os.makedirs(d, exist_ok=True)
+
+    # --- Download Manticore if needed ---
+    if os.path.exists(MANTICORE_BIN):
+        print("  Manticore binary already found, skipping download.")
+    else:
+        _download_manticore()
+
+    # --- Write config ---
+    _write_manticore_conf()
+
+    # --- Kill stale searchd ---
+    _kill_searchd()
+
+    # --- Start searchd in background ---
+    searchd_proc = subprocess.Popen(
+        [MANTICORE_BIN, '--config', MANTICORE_CONF],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Register cleanup: kill searchd when Python exits
+    import atexit
+    def _cleanup():
+        try:
+            if searchd_proc.poll() is None:
+                searchd_proc.kill()
+                searchd_proc.wait(timeout=5)
+        except Exception:
+            pass
+    atexit.register(_cleanup)
+
+    # --- Wait for port 9306 ---
+    print("  Waiting for Manticore to be ready...")
+    ready = False
+    for _ in range(30):
+        time.sleep(1)
+        try:
+            with socket.create_connection(('127.0.0.1', MANTICORE_PORT), timeout=1):
+                ready = True
+                break
+        except OSError:
+            pass
+
+    if not ready:
+        print("  ERROR: Manticore did not start within 30 seconds.")
+        input("  Press Enter to exit...")
+        sys.exit(1)
+
+    print()
+    print("  [OK] Environment ready.")
+    print()
+
+    return searchd_proc
+
+
+def _download_manticore():
+    print("  Downloading Manticore Search (version 25.0.0)...")
+    print("  This is about 50-60MB, please wait...")
+
+    hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        req = urllib.request.Request(MANTICORE_URL, headers=hdrs)
+        with urllib.request.urlopen(req, timeout=120, context=ctx) as r:
+            data = r.read()
+        with open(MANTICORE_ZIP, 'wb') as f:
+            f.write(data)
+    except Exception as e:
+        print(f"  ERROR: Download failed: {e}")
+        input("  Press Enter to exit...")
+        sys.exit(1)
+
+    print("  Extracting...")
+    try:
+        with zipfile.ZipFile(MANTICORE_ZIP) as z:
+            z.extractall(MANTICORE_DIR)
+    except Exception as e:
+        print(f"  ERROR: Extraction failed: {e}")
+        input("  Press Enter to exit...")
+        sys.exit(1)
+    finally:
+        if os.path.exists(MANTICORE_ZIP):
+            os.remove(MANTICORE_ZIP)
+
+    if not os.path.exists(MANTICORE_BIN):
+        print("  ERROR: searchd.exe not found after extraction.")
+        input("  Press Enter to exit...")
+        sys.exit(1)
+
+
+def _write_manticore_conf():
+    data_fwd  = BOOKS_BASE_DIR.replace('\\', '/')
+    logs_fwd  = MANTICORE_LOGS.replace('\\', '/')
+    conf = (
+        "searchd {\n"
+        "    listen           = 127.0.0.1:9306:mysql\n"
+        f"    log              = {logs_fwd}/searchd.log\n"
+        f"    query_log        = {logs_fwd}/query.log\n"
+        f"    pid_file         = {data_fwd}/searchd.pid\n"
+        f"    data_dir         = {data_fwd}\n"
+        "    query_log_format = sphinxql\n"
+        "}\n"
+    )
+    with open(MANTICORE_CONF, 'w', encoding='utf-8') as f:
+        f.write(conf)
+
+
+def _kill_searchd():
+    try:
+        out = subprocess.check_output(
+            ['tasklist', '/FI', 'IMAGENAME eq searchd.exe'],
+            stderr=subprocess.DEVNULL, text=True
+        )
+        if 'searchd.exe' in out:
+            print("  Stopping existing searchd process...")
+            subprocess.call(
+                ['taskkill', '/F', '/IM', 'searchd.exe'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            time.sleep(2)
+    except Exception as e:
+        print(f"  WARNING: Could not stop existing searchd: {e}")
+
+# ============================================================
+# MCP CHECK  (carried over from previous refactor)
+# ============================================================
+
+def find_mcp_process():
+    try:
+        out = subprocess.check_output(
+            ['wmic', 'process', 'where',
+             "name='python.exe' or name='pythonw.exe'",
+             'get', 'ProcessId,CommandLine', '/format:csv'],
+            stderr=subprocess.DEVNULL, text=True
+        )
+    except Exception as e:
+        print(f"  WARNING: Could not query processes via wmic: {e}")
+        return None, None
+
+    for line in out.splitlines():
+        if 'mcp_server.py' in line:
+            parts = line.split(',')
+            pid_str = parts[-1].strip()
+            if pid_str.isdigit():
+                pid = int(pid_str)
+                port = find_mcp_port(pid)
+                return pid, port
+
+    return None, None
+
+
+def find_mcp_port(pid):
+    try:
+        out = subprocess.check_output(
+            ['netstat', '-ano'],
+            stderr=subprocess.DEVNULL, text=True
+        )
+    except Exception:
+        return None
+
+    for pattern in [
+        rf'TCP\s+127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+{pid}',
+        rf'TCP\s+0\.0\.0\.0:(\d+)\s+\S+\s+LISTENING\s+{pid}',
+    ]:
+        m = re.search(pattern, out)
+        if m:
+            return m.group(1)
+
+    return None
+
+# ============================================================
+# DB HELPERS
+# ============================================================
+
 def get_conn():
     return pymysql.connect(
         host=MANTICORE_HOST, port=MANTICORE_PORT,
@@ -73,7 +285,10 @@ def bulk_insert(conn, rows):
     cur.executemany(sql, rows)
     conn.commit()
 
-# Catalog download & processing
+# ============================================================
+# CATALOG
+# ============================================================
+
 def load_catalog_bytes():
     os.makedirs(BOOKS_BASE_DIR, exist_ok=True)
     catalog_path = os.path.join(BOOKS_BASE_DIR, "pg_catalog.csv")
@@ -81,27 +296,27 @@ def load_catalog_bytes():
     if os.path.exists(catalog_path):
         print(f"  Using cached catalog: {catalog_path}")
         with open(catalog_path, 'rb') as f:
-            csv_bytes = f.read()
-    else:
-        print(f"  Downloading catalog from {CATALOG_URL} ...")
-        hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+            return f.read()
 
-        req = urllib.request.Request(CATALOG_URL, headers=hdrs)
-        with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
-            raw_gz = r.read()
+    print(f"  Downloading catalog from {CATALOG_URL} ...")
+    hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
 
-        print(f"  Downloaded {len(raw_gz):,} bytes. Decompressing...")
-        csv_bytes = gzip.decompress(raw_gz)
+    req = urllib.request.Request(CATALOG_URL, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
+        raw_gz = r.read()
 
-        with open(catalog_path, 'wb') as f:
-            f.write(csv_bytes)
+    print(f"  Downloaded {len(raw_gz):,} bytes. Decompressing...")
+    csv_bytes = gzip.decompress(raw_gz)
 
-        print(f"  Catalog saved to {catalog_path}")
-    
+    with open(catalog_path, 'wb') as f:
+        f.write(csv_bytes)
+
+    print(f"  Catalog saved to {catalog_path}")
     return csv_bytes
+
 
 def parse_and_filter_catalog(csv_bytes, wanted_langs):
     reader = csv.DictReader(io.StringIO(csv_bytes.decode('utf-8', errors='replace')))
@@ -110,23 +325,18 @@ def parse_and_filter_catalog(csv_bytes, wanted_langs):
     def norm(d):
         return {k.strip().lstrip('\ufeff'): v.strip() for k, v in d.items()}
 
-    rows =[norm(r) for r in rows]
-
+    rows = [norm(r) for r in rows]
     wanted = set(l.strip().lower() for l in wanted_langs)
-    kept =[]
-
-    for r in rows:
-        if r.get('Type', '').lower() != 'text':
-            continue
-        lang = r.get('Language', '').strip().lower()
-        if lang not in wanted:
-            continue
-        kept.append(r)
+    kept = [r for r in rows if r.get('Type', '').lower() == 'text'
+            and r.get('Language', '').strip().lower() in wanted]
 
     print(f"  {len(rows):,} total entries → {len(kept):,} text books in {wanted_langs}")
     return kept
 
-# Per-book download
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
 def _ssl_ctx():
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -135,7 +345,7 @@ def _ssl_ctx():
 
 def build_zip_urls(book_id):
     sid = str(book_id)
-    urls =[]
+    urls = []
 
     if book_id >= 100:
         urls.append(f"https://www.gutenberg.org/cache/epub/{sid}/pg{sid}.txt.utf8")
@@ -158,7 +368,7 @@ def build_zip_urls(book_id):
 def _decode_raw_text(data, hint=None, book_id=None):
     header = data[:2000].decode("ascii", errors="ignore")
     enc_match = re.search(r'Character set encoding:\s*([a-zA-Z0-9-]+)', header, re.IGNORECASE)
-    
+
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -168,15 +378,15 @@ def _decode_raw_text(data, hint=None, book_id=None):
             encoding = hint
         else:
             encoding = "iso-8859-1"
-        
+
         if encoding == "iso-8859-1":
             encoding = "windows-1252"
-        
+
         try:
             text = data.decode(encoding)
         except (LookupError, UnicodeDecodeError):
             text = data.decode("windows-1252", errors="replace")
-    
+
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     return normalize_unicode_punctuation(text)
 
@@ -210,14 +420,16 @@ def download_text(book_id):
         except Exception:
             continue
 
-    print(f" WARNING: all URLs failed for book {book_id}")
+    print(f"  WARNING: all URLs failed for book {book_id}")
     return None
 
-# Text processing
+# ============================================================
+# TEXT PROCESSING
+# ============================================================
+
 def chunk_prose(text):
     parts = re.split(r'(\n\s*\n)', text)
-    chunks =[]
-
+    chunks = []
     current_chunk = ""
     chunk_start_offset = 0
     raw_offset = 0
@@ -226,19 +438,16 @@ def chunk_prose(text):
     while i < len(parts):
         para_raw = parts[i]
         para_text = para_raw.strip()
-
         leading_ws = len(para_raw) - len(para_raw.lstrip())
         para_content_start = raw_offset + leading_ws
 
         if para_text:
             if not current_chunk:
                 chunk_start_offset = para_content_start
-
             if len(current_chunk) + len(para_text) > CHUNK_CHARS and current_chunk:
                 chunks.append((current_chunk, chunk_start_offset))
                 current_chunk = ""
                 chunk_start_offset = para_content_start
-
             current_chunk += ("\n\n" if current_chunk else "") + para_text
 
         raw_offset += len(para_raw)
@@ -262,9 +471,54 @@ def is_already_indexed(conn, book_id):
     )
     return cur.fetchone()[0] > 0
 
-# Main
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    print(f"\n  Connecting to Manticore {MANTICORE_HOST}:{MANTICORE_PORT}...")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--setup', action='store_true',
+        help='Run full setup (download Manticore, start it, then index). '
+             'Used by download_books.bat.'
+    )
+    args = parser.parse_args()
+
+    searchd_proc = None
+
+    if args.setup:
+        # Full ps1-equivalent flow
+        searchd_proc = setup_manticore()
+    else:
+        # launch.bat flow: just check MCP server is running
+        print()
+        print("  Checking MCP server...")
+        pid, port = find_mcp_process()
+
+        if pid is None:
+            print()
+            print("============================================================")
+            print("  ERROR: MCP SERVER IS NOT RUNNING")
+            print("============================================================")
+            print()
+            print("  Please run 'Local-MCP-server\\launch.bat' and keep that window open.")
+            print()
+            input("  Press Enter to exit...")
+            sys.exit(1)
+
+        print()
+        print("============================================================")
+        print(" PROJECT GUTENBERG - RUNNING")
+        print("============================================================")
+        print()
+        if port:
+            print(f"  [OK] MCP server detected on port {port} (PID {pid})")
+        else:
+            print(f"  [OK] MCP server detected (PID {pid}, port unknown)")
+        print()
+
+    # Connect to Manticore
+    print(f"  Connecting to Manticore {MANTICORE_HOST}:{MANTICORE_PORT}...")
     try:
         conn = get_conn()
     except Exception as e:
@@ -274,10 +528,9 @@ def main():
 
     create_table(conn)
 
-    # 1. Load the catalog bytes silently first
+    # Catalog
     csv_bytes = load_catalog_bytes()
 
-    # 2. Ask user for language preferences
     print("\n------------------------------------------------------------")
     print("  USER INPUT REQUIRED")
     print("------------------------------------------------------------\n")
@@ -292,14 +545,13 @@ def main():
     if not lang_input:
         lang_input = "en"
 
-    wanted_langs =[l.strip().lower() for l in lang_input.split(',') if l.strip()]
+    wanted_langs = [l.strip().lower() for l in lang_input.split(',') if l.strip()]
     print(f"\n  Will download: {', '.join(wanted_langs)}\n")
 
     print("------------------------------------------------------------")
     print("  INDEXER SCRIPT STARTING")
     print("------------------------------------------------------------\n")
 
-    # 3. Filter catalog by desired languages
     catalog = parse_and_filter_catalog(csv_bytes, wanted_langs)
 
     from collections import defaultdict
@@ -312,32 +564,31 @@ def main():
         print(f"  {lang}: {len(rows):,}")
 
     total_available = sum(len(v) for v in per_lang.values())
-    print(f"  ─────────────────")
+    print(f"  -----------------")
     print(f"  Total: {total_available:,}\n")
 
-    # 4. Ask user for limit limit
     limit_input = input("  How many books per language? (Just press Enter for all): ").strip()
 
     if not limit_input or limit_input.lower() == "all":
         max_books = 0
-        print(f" FULL MODE: all {total_available:,} books.")
+        print(f"  FULL MODE: all {total_available:,} books.")
     elif limit_input.isdigit() and int(limit_input) > 0:
         max_books = int(limit_input)
         capped = sum(min(len(v), max_books) for v in per_lang.values())
-        print(f" LIMITED MODE: up to {max_books:,} per language ({capped:,} total).")
+        print(f"  LIMITED MODE: up to {max_books:,} per language ({capped:,} total).")
     else:
         max_books = 0
-        print(f" Unrecognized input, defaulting to full download ({total_available:,} books).")
+        print(f"  Unrecognized input, defaulting to full download ({total_available:,} books).")
 
-    print("")
+    print()
 
     if max_books > 0:
-        catalog =[]
+        catalog = []
         for lang_rows in per_lang.values():
             catalog.extend(lang_rows[:max_books])
 
     total = 0
-    batch =[]
+    batch = []
 
     for idx, row in enumerate(catalog, 1):
         book_id = int(row.get('Text#', 0) or 0)
@@ -383,7 +634,26 @@ def main():
         total += len(batch)
 
     conn.close()
-    print(f"\nDone! {total} total paragraphs indexed.")
+
+    print()
+    print("============================================================")
+    print("  INDEXING COMPLETE")
+    print("============================================================")
+    print()
+
+    if searchd_proc is not None:
+        print("  Stopping Manticore background process...")
+        try:
+            if searchd_proc.poll() is None:
+                searchd_proc.kill()
+                searchd_proc.wait(timeout=5)
+            print("  [OK] Stopped.")
+        except Exception as e:
+            print(f"  WARNING: Could not stop searchd cleanly: {e}")
+    
+    print()
+    input("  Press Enter to exit...")
+
 
 if __name__ == "__main__":
     main()
