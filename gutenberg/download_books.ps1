@@ -1,4 +1,4 @@
-$host.UI.RawUI.WindowTitle = "Gutenberg Prose Search - Download & Index"
+$host.UI.RawUI.WindowTitle = "Project Gutenberg - Download & Index"
 
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvDir    = Join-Path $ScriptDir "..\venv"
@@ -18,50 +18,17 @@ $PythonExe   = Join-Path $VenvDir "Scripts\python.exe"
 
 Write-Host ""
 Write-Host "============================================================"
-Write-Host "  GUTENBERG PROSE SEARCH - DOWNLOAD & INDEX  (no Docker)"
+Write-Host "  PROJECT GUTENBERG - DOWNLOAD & INDEX"
 Write-Host "============================================================"
 Write-Host ""
-Write-Host "This will:"
-Write-Host "  1. Ask which languages to download"
-Write-Host "  2. Download and extract Manticore Search (zip, no installer)"
-Write-Host "  3. Start it as a background process (no service needed)"
-Write-Host "  4. Download the Gutenberg corpus"
-Write-Host "  5. Index all books into Manticore (index files)    -> books"
-Write-Host ""
-Read-Host "Press Enter to continue"
-
-# ============================================================
-# STEP 1 - LANGUAGE SELECTION
-# ============================================================
-
-Write-Host ""
-Write-Host "[1/5] Language selection"
-Write-Host ""
-Write-Host "  Enter the languages you want to download from Gutenberg."
-Write-Host "  Use 2-letter codes separated by commas (example: en, la)."
-Write-Host ""
-Write-Host "  Common codes:"
-Write-Host "    en = English    fr = French    de = German"
-Write-Host "    it = Italian    es = Spanish   pt = Portuguese"
-Write-Host "    nl = Dutch      fi = Finnish   la = Latin"
-Write-Host ""
-
-$LanguagesInput = Read-Host "Your languages (default: en)"
-if ([string]::IsNullOrWhiteSpace($LanguagesInput)) { $LanguagesInput = "en" }
-
-$Languages = $LanguagesInput.Split(',') |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -ne "" }
-
-Write-Host ""
-Write-Host "  Will download: $($Languages -join ', ')"
+Write-Host "  Please wait while the environment is prepared..."
 Write-Host ""
 
 # ============================================================
-# STEP 2 - DOWNLOAD AND EXTRACT MANTICORE
+# PHASE 1 - DOWNLOAD AND EXTRACT MANTICORE
 # ============================================================
 
-Write-Host "[2/5] Setting up Manticore Search..."
+Write-Host "  Setting up Manticore Search..."
 Write-Host ""
 
 foreach ($dir in @($ManticoreDir, $ManticoreData, $ManticoreLogs, $BooksDir)) {
@@ -84,38 +51,22 @@ else {
     catch {
         Write-Host ""
         Write-Host "  ERROR: Download failed: $_"
-        Write-Host "  Please download manually from:"
-        Write-Host "  https://manticoresearch.com/install/"
-        Write-Host "  Extract into: $ManticoreDir"
         Read-Host "Press Enter to exit"
         exit 1
     }
 
     Write-Host "  Extracting..."
-    try {
-        Expand-Archive -Path $ManticoreZip -DestinationPath $ManticoreDir -Force
-        Remove-Item $ManticoreZip -Force
-    }
-    catch {
-        Write-Host "  ERROR: Extraction failed: $_"
-        Read-Host "Press Enter to exit"
-        exit 1
-    }
+    Expand-Archive -Path $ManticoreZip -DestinationPath $ManticoreDir -Force
+    Remove-Item $ManticoreZip -Force
 
     if (-not (Test-Path $ManticoreBin)) {
         Write-Host "  ERROR: searchd.exe not found after extraction."
-        Get-ChildItem $ManticoreDir -Recurse -Filter "searchd.exe"
         Read-Host "Press Enter to exit"
         exit 1
     }
-
-    Write-Host "  Manticore extracted successfully."
 }
 
 # Write config
-Write-Host ""
-Write-Host "  Writing Manticore config..."
-
 $DataFwd = $ManticoreData.Replace('\', '/')
 $LogsFwd = $ManticoreLogs.Replace('\', '/')
 
@@ -130,19 +81,11 @@ searchd {
 }
 "@ | Set-Content $ManticoreConf -Encoding UTF8
 
-Write-Host "  Config written."
-Write-Host "  Index files : $ManticoreData"
-
-# Kill any leftover searchd from a previous run
 $stale = Get-Process -Name "searchd" -ErrorAction SilentlyContinue
 if ($stale) {
-    Write-Host "  Stopping leftover searchd process..."
     $stale | Stop-Process -Force
     Start-Sleep -Seconds 2
 }
-
-Write-Host ""
-Write-Host "  Starting Manticore as a background process..."
 
 $searchd = Start-Process `
     -FilePath $ManticoreBin `
@@ -150,12 +93,7 @@ $searchd = Start-Process `
     -PassThru `
     -WindowStyle Hidden
 
-
-# ============================================================
-# NEW WATCHER PROCESS LOGIC
-# ============================================================
-# Start a completely hidden watcher process that waits for THIS script to die, 
-# and automatically cleans up searchd.exe if the "X" button is clicked.
+# Watcher process
 $WatcherArgs = "-NoProfile -Command `"Wait-Process -Id $PID -ErrorAction SilentlyContinue; Stop-Process -Id $($searchd.Id) -Force -ErrorAction SilentlyContinue`""
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "powershell.exe"
@@ -165,14 +103,10 @@ $psi.CreateNoWindow = $true
 $psi.UseShellExecute = $false
 [System.Diagnostics.Process]::Start($psi) | Out-Null
 
-# We still register the graceful exit event, but correctly pass variables using -MessageData
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -MessageData $searchd.Id -Action {
     Get-Process -Id $Event.MessageData -ErrorAction SilentlyContinue | Stop-Process -Force
 } | Out-Null
-# ============================================================
 
-
-# Poll port 9306 up to 30 seconds
 $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
@@ -185,19 +119,14 @@ for ($i = 0; $i -lt 30; $i++) {
 }
 
 if (-not $ready) {
-    Write-Host "  ERROR: Manticore did not start within 30 seconds."
+    Write-Host "  ERROR: Manticore did not start."
     Read-Host "Press Enter to exit"
     exit 1
 }
 
-Write-Host "[OK] ManticoreSearch ready on port 9306."
-
 # ============================================================
-# STEP 3 - PYTHON DEPS
+# PHASE 2 - PYTHON DEPS
 # ============================================================
-
-Write-Host ""
-Write-Host "[3/5] Installing Python dependencies..."
 
 if (-not (Test-Path $PythonExe)) {
     Write-Host "  ERROR: venv not found at $VenvDir"
@@ -206,14 +135,10 @@ if (-not (Test-Path $PythonExe)) {
 }
 
 & $PythonExe -m pip install pymysql --quiet
-Write-Host "  pymysql installed."
 
 # ============================================================
-# STEP 4 - PREPARE INDEX SCRIPT
+# PHASE 3 - RUN INDEXER
 # ============================================================
-
-Write-Host ""
-Write-Host "[4/5] Preparing index script..."
 
 if (-not (Test-Path $IndexScript)) {
     Write-Host "  ERROR: index_gutenberg.py not found."
@@ -221,19 +146,16 @@ if (-not (Test-Path $IndexScript)) {
     exit 1
 }
 
-$env:GUTENBERG_LANGUAGES = $Languages -join ','
-Write-Host "  Index script will use languages: $($Languages -join ', ')"
-
-# ============================================================
-# STEP 5 - RUN INDEXER
-# ============================================================
-
 Write-Host ""
-Write-Host "[5/5] Starting indexer"
+Write-Host "  [OK] Environment ready."
 Write-Host ""
+Write-Host "------------------------------------------------------------"
+Write-Host "  INDEXER SCRIPT STARTING"
+Write-Host "------------------------------------------------------------"
 
-# We only run this once because the Python script natively prompts for limits.
+# Call the Python script
 & $PythonExe $IndexScript
+
 
 # ============================================================
 # DONE - STOP BACKGROUND PROCESS
@@ -249,14 +171,10 @@ Write-Host "  Stopping Manticore background process..."
 if ($searchd -and -not $searchd.HasExited) {
     $searchd.Kill()
     $searchd.WaitForExit(5000) | Out-Null
-}
-else {
-    # Fallback in case the variable was lost
+} else {
     Get-Process -Name "searchd" -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
 Write-Host "  [OK] Stopped."
-Write-Host ""
-Write-Host "  Run launch.ps1 to start Manticore Search."
 Write-Host ""
 Read-Host "Press Enter to exit"
