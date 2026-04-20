@@ -8,3 +8,5 @@ starlette
 Pillow
 readability-lxml 
 markdownify
+certifi
+pymysql
