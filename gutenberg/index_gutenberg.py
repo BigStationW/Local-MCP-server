@@ -1,7 +1,6 @@
 import re, time, io, zipfile, gzip, csv, urllib.request, sys, ssl, os
 import pymysql
 
-LANGUAGES = os.environ.get("GUTENBERG_LANGUAGES", "en").split(',')
 CHUNK_CHARS = 600
 BATCH_SIZE = 300
 SLEEP_SEC = 1.0
@@ -16,7 +15,7 @@ BOOKS_BASE_DIR = os.path.join(SCRIPT_DIR, "books")
 CATALOG_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
 
 # Unicode normalization
-UNICODE_REPLACEMENTS = [
+UNICODE_REPLACEMENTS =[
     ('\u2019', "'"),
     ('\u2018', "'"),
     ('\u02bc', "'"),
@@ -62,7 +61,7 @@ def create_table(conn):
         index_sp='1'
     """)
     conn.commit()
-    print("Table ready.")
+    print("  Table ready.")
 
 def bulk_insert(conn, rows):
     if not rows:
@@ -74,17 +73,17 @@ def bulk_insert(conn, rows):
     cur.executemany(sql, rows)
     conn.commit()
 
-# Catalog download
-def fetch_catalog(wanted_langs):
+# Catalog download & processing
+def load_catalog_bytes():
     os.makedirs(BOOKS_BASE_DIR, exist_ok=True)
     catalog_path = os.path.join(BOOKS_BASE_DIR, "pg_catalog.csv")
 
     if os.path.exists(catalog_path):
-        print(f"Using cached catalog: {catalog_path}")
+        print(f"  Using cached catalog: {catalog_path}")
         with open(catalog_path, 'rb') as f:
             csv_bytes = f.read()
     else:
-        print(f"Downloading catalog from {CATALOG_URL} ...")
+        print(f"  Downloading catalog from {CATALOG_URL} ...")
         hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -101,17 +100,20 @@ def fetch_catalog(wanted_langs):
             f.write(csv_bytes)
 
         print(f"  Catalog saved to {catalog_path}")
+    
+    return csv_bytes
 
+def parse_and_filter_catalog(csv_bytes, wanted_langs):
     reader = csv.DictReader(io.StringIO(csv_bytes.decode('utf-8', errors='replace')))
     rows = list(reader)
 
     def norm(d):
         return {k.strip().lstrip('\ufeff'): v.strip() for k, v in d.items()}
 
-    rows = [norm(r) for r in rows]
+    rows =[norm(r) for r in rows]
 
     wanted = set(l.strip().lower() for l in wanted_langs)
-    kept = []
+    kept =[]
 
     for r in rows:
         if r.get('Type', '').lower() != 'text':
@@ -121,7 +123,7 @@ def fetch_catalog(wanted_langs):
             continue
         kept.append(r)
 
-    print(f" {len(rows):,} total entries → {len(kept):,} text books in {wanted_langs}")
+    print(f"  {len(rows):,} total entries → {len(kept):,} text books in {wanted_langs}")
     return kept
 
 # Per-book download
@@ -133,7 +135,7 @@ def _ssl_ctx():
 
 def build_zip_urls(book_id):
     sid = str(book_id)
-    urls = []
+    urls =[]
 
     if book_id >= 100:
         urls.append(f"https://www.gutenberg.org/cache/epub/{sid}/pg{sid}.txt.utf8")
@@ -214,7 +216,7 @@ def download_text(book_id):
 # Text processing
 def chunk_prose(text):
     parts = re.split(r'(\n\s*\n)', text)
-    chunks = []
+    chunks =[]
 
     current_chunk = ""
     chunk_start_offset = 0
@@ -262,35 +264,59 @@ def is_already_indexed(conn, book_id):
 
 # Main
 def main():
-    print(f"\nConnecting to Manticore {MANTICORE_HOST}:{MANTICORE_PORT}...")
+    print(f"\n  Connecting to Manticore {MANTICORE_HOST}:{MANTICORE_PORT}...")
     try:
         conn = get_conn()
     except Exception as e:
-        print(f"ERROR: Cannot connect: {e}")
-        print("Make sure the ManticoreSearch service is running.")
+        print(f"  ERROR: Cannot connect: {e}")
+        print("  Make sure the ManticoreSearch service is running.")
         raise
 
     create_table(conn)
 
-    catalog = fetch_catalog(LANGUAGES)
+    # 1. Load the catalog bytes silently first
+    csv_bytes = load_catalog_bytes()
+
+    # 2. Ask user for language preferences
+    print("\n------------------------------------------------------------")
+    print("  USER INPUT REQUIRED")
+    print("------------------------------------------------------------\n")
+    print("  Select the languages of the books you want to download from Project Gutenberg.")
+    print("  Use 2-letter codes separated by commas (example: en, la).\n")
+    print("  Common codes:")
+    print("    en = English    fr = French    de = German")
+    print("    it = Italian    es = Spanish   pt = Portuguese")
+    print("    nl = Dutch      fi = Finnish   la = Latin\n")
+
+    lang_input = input("  Type the languages here (default: en): ").strip()
+    if not lang_input:
+        lang_input = "en"
+
+    wanted_langs =[l.strip().lower() for l in lang_input.split(',') if l.strip()]
+    print(f"\n  Will download: {', '.join(wanted_langs)}\n")
+
+    print("------------------------------------------------------------")
+    print("  INDEXER SCRIPT STARTING")
+    print("------------------------------------------------------------\n")
+
+    # 3. Filter catalog by desired languages
+    catalog = parse_and_filter_catalog(csv_bytes, wanted_langs)
 
     from collections import defaultdict
     per_lang = defaultdict(list)
     for row in catalog:
         per_lang[row['Language'].strip().lower()].append(row)
 
-    print("\n Books available per language:")
+    print("\n  Books available per language:")
     for lang, rows in sorted(per_lang.items()):
-        print(f" {lang}: {len(rows):,}")
+        print(f"  {lang}: {len(rows):,}")
 
     total_available = sum(len(v) for v in per_lang.values())
-    print(f" ─────────────────")
-    print(f" Total: {total_available:,}\n")
+    print(f"  ─────────────────")
+    print(f"  Total: {total_available:,}\n")
 
-    if len(sys.argv) > 1:
-        limit_input = sys.argv[1]
-    else:
-        limit_input = input(" How many books per language? (Just press Enter for all): ").strip()
+    # 4. Ask user for limit limit
+    limit_input = input("  How many books per language? (Just press Enter for all): ").strip()
 
     if not limit_input or limit_input.lower() == "all":
         max_books = 0
@@ -306,12 +332,12 @@ def main():
     print("")
 
     if max_books > 0:
-        catalog = []
+        catalog =[]
         for lang_rows in per_lang.values():
             catalog.extend(lang_rows[:max_books])
 
     total = 0
-    batch = []
+    batch =[]
 
     for idx, row in enumerate(catalog, 1):
         book_id = int(row.get('Text#', 0) or 0)
