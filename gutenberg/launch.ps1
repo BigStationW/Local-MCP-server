@@ -39,7 +39,6 @@ try {
         Write-Host "  ERROR: MCP SERVER IS NOT RUNNING" -ForegroundColor Red
         Write-Host "============================================================" -ForegroundColor Red
         Write-Host ""
-        Write-Host "  mcp_server.py does not appear to be running."
         Write-Host "  Please run 'Local-MCP-server\launch.bat' and keep that window open."
         Write-Host ""
         Read-Host "  Press Enter to exit..."
