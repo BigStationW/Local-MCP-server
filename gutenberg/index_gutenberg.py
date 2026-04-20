@@ -496,7 +496,25 @@ def main():
     searchd_proc = None
 
     if args.serve:
-        # Just start Manticore and keep it running (for launch_gutenberg.bat)
+        # Check if MCP server is running FIRST
+        print()
+        print("  Checking MCP server...")
+        pid, port = find_mcp_process()
+
+        if pid is None:
+            print()
+            print("============================================================")
+            print("  ERROR: MCP SERVER IS NOT RUNNING")
+            print("============================================================")
+            print()
+            print("  Please run 'Local-MCP-server\\launch.bat' and keep that window open.")
+            print()
+            input("  Press Enter to exit...")
+            sys.exit(1)
+
+        print(f"  MCP server detected")
+
+        # Only start Manticore if MCP server is running
         searchd_proc = setup_manticore(verbose=False)
         
         print("============================================================")
