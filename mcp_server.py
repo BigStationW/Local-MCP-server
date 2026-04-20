@@ -29,66 +29,6 @@ import pymysql as _pymysql
 import os as _os
 import re as _re
 
-# Load Gutenberg catalog once at startup (optional)
-_GUTENBERG_AUTHORS = {}
-_GUTENBERG_CATEGORIES = {} 
-_GUTENBERG_TITLES = {}
-_GUTENBERG_LANGUAGES = {}
-
-def _parse_author(raw: str) -> str:
-    """Take first author, strip dates, return clean name."""
-    first = raw.split(';')[0].strip()
-    return re.sub(r',\s*\d{4}-\d{0,4}$', '', first).strip()
-
-def _parse_categories(bookshelves: str) -> list:
-    """Extract Category:-prefixed entries and strip the prefix."""
-    cats = []
-    for entry in bookshelves.split(';'):
-        entry = entry.strip()
-        if entry.startswith('Category:'):
-            cats.append(entry[len('Category:'):].strip())
-    return cats
-
-def _load_gutenberg_catalog():
-    """Load pg_catalog.csv into memory for fast lookups."""
-    global _GUTENBERG_AUTHORS
-    if _GUTENBERG_AUTHORS:
-        return
-        
-    catalog_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "gutenberg", "books", "pg_catalog.csv"
-    )
-    
-    if not os.path.exists(catalog_path):
-        logging.debug("Gutenberg catalog not found")
-        return
-    
-    try:
-        import csv
-        with open(catalog_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                book_id = int(row.get('Text#', 0) or 0)
-                if not book_id:
-                    continue
-                
-                author_raw = row.get('Authors', 'Unknown').strip() or 'Unknown'
-                title_raw = row.get('Title', 'Unknown').strip() or 'Unknown'
-                lang = row.get('Language', '').strip().lower()
-
-                _GUTENBERG_AUTHORS[book_id] = _parse_author(author_raw)
-                _GUTENBERG_CATEGORIES[book_id] = _parse_categories(row.get('Bookshelves', ''))
-                _GUTENBERG_TITLES[book_id] = title_raw
-                _GUTENBERG_LANGUAGES[book_id] = lang
-
-        logging.info(f"Loaded {len(_GUTENBERG_AUTHORS)} books from Gutenberg catalog")
-    except Exception as e:
-        logging.warning(f"Could not load Gutenberg catalog: {e}")
-
-# Load catalog at module import time
-_load_gutenberg_catalog()
-
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
@@ -377,7 +317,7 @@ def date_time() -> str:
 @mcp.tool()
 async def gutenberg_search(
     query: str,
-    language: str = "en",
+    language: str = None,
     max_results: int = 10,
     offset: int = 0,
     proximity: int = 50,
@@ -395,9 +335,9 @@ async def gutenberg_search(
     Body text is weighted 10× higher than title text.
     The first result is therefore the strongest match; quality degrades toward the end.
 
-Args:
+    Args:
         query:       Start with complete sentences, then simplify if no results appear.
-        language:    Two-letter code. Default "en".
+        language:    Two-letter code (e.g. "en", "la"). Default None (all languages).
         max_results: Number of paragraphs to return per page (default 10).
         offset:      Zero-based index of the first result to return (default 0).
                      Use offset=10 to get results 11-20, offset=20 for 21-30, etc.
@@ -418,36 +358,37 @@ Args:
     words = [w.strip() for w in clean_query.split() if w.strip()]
     if not words:
         return "Empty query."
- 
-    lang_safe = language.replace("'", "")[:5]
- 
+
     def _make_sql(fts_expr: str) -> str:
         fts_safe = fts_expr.replace("'", "''")
+        lang_filter = f" AND language='{language.replace(chr(39), '')[:5]}'" if language else ""
+        author_filter = f" AND author LIKE '%{author.replace(chr(39), '')}%'" if author else ""
+        category_filter = f" AND bookshelves LIKE '%{category.replace(chr(39), '')}%'" if category else ""
         return (
-            "SELECT book_id, title, author, language, start_char, body "
+            "SELECT book_id, title, author, language, bookshelves, start_char, body "
             "FROM gutenberg_paragraphs "
-            f"WHERE MATCH('{fts_safe}') AND language='{lang_safe}' "
+            f"WHERE MATCH('{fts_safe}'){lang_filter}{author_filter}{category_filter} "
             f"LIMIT {int(offset)}, {int(max_results)} "
             "OPTION ranker=proximity_bm25, field_weights=(body=10,title=1)"
         )
- 
+
     proximity_fts = (
         words[0] if len(words) == 1
         else f" NEAR/{int(proximity)} ".join(words)
     )
     fallback_fts = " ".join(words)
- 
+
     try:
         conn = _manticore_conn()
         cur = conn.cursor(_pymysql.cursors.DictCursor)
- 
+
         cur.execute(_make_sql(proximity_fts))
         rows = cur.fetchall()
         cur.execute("SHOW META")
         meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
         total_found = int(meta.get("total_found", len(rows)))
         used_fallback = False
- 
+
         if not rows and len(words) > 1:
             cur.execute(_make_sql(fallback_fts))
             rows = cur.fetchall()
@@ -455,9 +396,9 @@ Args:
             meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
             total_found = int(meta.get("total_found", len(rows)))
             used_fallback = True
- 
+
         conn.close()
- 
+
     except _pymysql.OperationalError as e:
         return (
             f"❌ Cannot connect to Manticore Search: {e}\n"
@@ -465,14 +406,9 @@ Args:
         )
     except Exception as e:
         return f"Manticore query error: {type(e).__name__}: {e}"
-    
-    if author:
-        author_lower = author.lower()
-        rows = [r for r in rows if author_lower in _GUTENBERG_AUTHORS.get(r['book_id'], '').lower()]
-    if category:
-        category_lower = category.lower()
-        rows = [r for r in rows if any(category_lower in c.lower() for c in _GUTENBERG_CATEGORIES.get(r['book_id'], []))]
- 
+
+    lang_display = language or "any"
+
     if not rows:
         filter_note = ""
         if author or category:
@@ -481,15 +417,15 @@ Args:
             if category: parts.append(f"category='{category}'")
             filter_note = f" with filters ({', '.join(parts)})"
         return (
-            f"No prose matches for '{query}'{filter_note} (language={language}, proximity={proximity}).\n\n"
+            f"No prose matches for '{query}'{filter_note} (language={lang_display}, proximity={proximity}).\n\n"
             "Diagnosis:\n"
             "  1. Try fewer words — 2 is often better than 4.\n"
             "  2. Increase proximity= to 150 or 200.\n"
             "  3. Use words from the middle of sentences, not headings or dialogue tags.\n"
-            f"  4. Confirm language='{language}' is indexed.\n"
+            f"  4. If you want a specific language, pass language='en' (or another code).\n"
             "  5. If using author= or category=, try broadening or removing those filters."
         )
- 
+
     fallback_note = (
         f"\n⚠️  Proximity/{proximity} search returned 0 results — falling back to plain-match "
         f"(all query words appear in these paragraphs, but may be far apart). "
@@ -497,12 +433,12 @@ Args:
         f"To get proximity-ranked results, try increasing proximity= to 150 or 200.\n"
         if used_fallback else ""
     )
- 
+
     first = offset + 1
     last  = offset + len(rows)
     lines = [
         f"Found {total_found} prose match(es) for '{query}' "
-        f"(language={language}, proximity={proximity}) — displaying {first}–{last}:"
+        f"(language={lang_display}, proximity={proximity}) — displaying {first}–{last}:"
         f"{fallback_note}\n"
     ]
 
@@ -512,17 +448,16 @@ Args:
         if len(body) <= 400:
             snippet = body
         else:
-            # Find the first sentence-ending punctuation AT or AFTER char 400
             match = re.search(r'[.!?]', body[400:])
             if match:
                 snippet = body[:400 + match.start() + 1]
             else:
-                snippet = body[:400].rsplit(' ', 1)[0] + '…' 
-        
+                snippet = body[:400].rsplit(' ', 1)[0] + '…'
+
         end_char = row['start_char'] + len(snippet)
 
-        cats = _GUTENBERG_CATEGORIES.get(row['book_id'], [])
-        cat_str = f"   categories: {', '.join(cats)}\n" if cats else ""
+        bookshelves = (row.get('bookshelves') or '').strip()
+        cat_str = f"   categories: {bookshelves}\n" if bookshelves else ""
         lines.append(
             f"{i}. {row['title']} by {row['author']}\n"
             f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
@@ -566,15 +501,12 @@ async def read_book_content(
         start_char: Starting character position as returned by gutenberg_search (default 0).
         max_chars:  Maximum characters to return (default 5000). Set to 0 for no limit.
     """
-    title = _GUTENBERG_TITLES.get(book_id, "Unknown")
-    author = _GUTENBERG_AUTHORS.get(book_id, "Unknown")
-    lang = _GUTENBERG_LANGUAGES.get(book_id, "Unknown")
 
     try:
         conn = _manticore_conn()
         cur = conn.cursor(_pymysql.cursors.DictCursor)
         cur.execute(
-            "SELECT body, start_char FROM gutenberg_paragraphs "
+            "SELECT title, author, language, body, start_char FROM gutenberg_paragraphs "
             "WHERE book_id = %s AND start_char >= %s "
             "ORDER BY start_char ASC "
             "LIMIT 50",
@@ -599,6 +531,9 @@ async def read_book_content(
         passage += chunk + "\n\n"
         next_start = row["start_char"] + len(chunk)
 
+    title = rows[0].get("title", "Unknown")
+    author = rows[0].get("author", "Unknown")
+    lang = rows[0].get("language", "Unknown")
     return "\n".join([
         f"Book: {title} by {author} (book_id={book_id}, language={lang})",
         f"Passage starting at char {start_char} ({len(passage.strip())} chars returned)",
@@ -696,7 +631,6 @@ async def puppeteer_session_find_images(
     page = browser_manager.sessions.get(session_id)
     if not page:
         return [f"Error: No session found with session_id '{session_id}'."]
-
     try:
         batch_ts = int(datetime.now().timestamp())
         images = await page.evaluate(f"""
