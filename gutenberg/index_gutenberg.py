@@ -11,8 +11,6 @@ MANTICORE_PORT = 9306
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BOOKS_BASE_DIR = os.path.join(SCRIPT_DIR, "books")
-BOOKS_TXT_DIR = os.environ.get("GUTENBERG_TXT_DIR", os.path.join(BOOKS_BASE_DIR, "txt"))
-BOOKS_INDEX_DIR = os.path.join(BOOKS_BASE_DIR, "index")
 
 # Catalog URL — single ~14 MB gzipped CSV
 CATALOG_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
@@ -41,11 +39,6 @@ def normalize_unicode_punctuation(text):
     return text
 
 # Helpers
-def sanitize_filename(s):
-    s = re.sub(r'[<>:"/\\|?*]', '', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s[:80]
-
 def get_conn():
     return pymysql.connect(
         host=MANTICORE_HOST, port=MANTICORE_PORT,
@@ -69,16 +62,6 @@ def create_table(conn):
     """)
     conn.commit()
     print("Table ready.")
-
-def create_meta_table(conn):
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS gutenberg_meta (
-            book_id integer,
-            char_count integer
-        )
-    """)
-    conn.commit()
 
 def bulk_insert(conn, rows):
     if not rows:
@@ -173,11 +156,9 @@ def _decode_raw_text(data, hint=None, book_id=None):
     header = data[:2000].decode("ascii", errors="ignore")
     enc_match = re.search(r'Character set encoding:\s*([a-zA-Z0-9-]+)', header, re.IGNORECASE)
     
-    # Try UTF-8 first
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        # Fall back to declared encoding or hint
         if enc_match:
             encoding = enc_match.group(1).lower()
         elif hint:
@@ -185,8 +166,6 @@ def _decode_raw_text(data, hint=None, book_id=None):
         else:
             encoding = "iso-8859-1"
         
-        # ISO-8859-1 files from Gutenberg are often actually Windows-1252
-        # (they have smart quotes in the 0x80-0x9F range)
         if encoding == "iso-8859-1":
             encoding = "windows-1252"
         
@@ -280,33 +259,6 @@ def is_already_indexed(conn, book_id):
     )
     return cur.fetchone()[0] > 0
 
-def get_indexed_char_count(conn, book_id):
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT char_count FROM gutenberg_meta WHERE book_id = %s LIMIT 1",
-        (book_id,)
-    )
-    row = cur.fetchone()
-    return int(row[0]) if row else 0
-
-def delete_book_from_index(conn, book_id):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM gutenberg_paragraphs WHERE book_id = %s", (book_id,))
-    conn.commit()
-    cur.execute("DELETE FROM gutenberg_meta WHERE book_id = %s", (book_id,))
-    conn.commit()
-    print(f" Deleted old index entries for book_id={book_id}.")
-
-def save_char_count(conn, book_id, char_count):
-    cur = conn.cursor()
-    cur.execute("DELETE FROM gutenberg_meta WHERE book_id = %s", (book_id,))
-    conn.commit()
-    cur.execute(
-        "INSERT INTO gutenberg_meta (book_id, char_count) VALUES (%s, %s)",
-        (book_id, char_count)
-    )
-    conn.commit()
-
 # Main
 def main():
     print(f"\nConnecting to Manticore {MANTICORE_HOST}:{MANTICORE_PORT}...")
@@ -318,8 +270,6 @@ def main():
         raise
 
     create_table(conn)
-    create_meta_table(conn)
-    os.makedirs(BOOKS_TXT_DIR, exist_ok=True)
 
     catalog = fetch_catalog(LANGUAGES)
 
@@ -371,43 +321,17 @@ def main():
         if not book_id:
             continue
 
-        book_filename = f"{sanitize_filename(author)} - {sanitize_filename(title)} ({lang}).txt"
-        book_path = os.path.join(BOOKS_TXT_DIR, book_filename)
-
         print(f"[{idx}/{len(catalog)}] #{book_id} — {title[:60]}")
 
-        if os.path.exists(book_path) and is_already_indexed(conn, book_id):
-            with open(book_path, encoding='utf-8', errors='replace') as f:
-                disk_content = f.read()
+        if is_already_indexed(conn, book_id):
+            print("    Already indexed, skipping.")
+            continue
 
-            disk_char_count = len(disk_content)
-            stored_size = get_indexed_char_count(conn, book_id)
+        raw = download_text(book_id)
+        if not raw:
+            continue
 
-            if abs(disk_char_count - stored_size) < 1000:
-                print("    Already indexed and file unchanged, skipping.")
-                continue
-            else:
-                print(f"    File changed since indexing (disk={disk_char_count}, indexed≈{stored_size}), re-indexing.")
-                delete_book_from_index(conn, book_id)
-                raw = disk_content
-
-        elif os.path.exists(book_path):
-            print("    File exists, indexing from disk.")
-            with open(book_path, encoding='utf-8', errors='replace') as f:
-                raw = f.read()
-
-        else:
-            raw = download_text(book_id)
-            if not raw:
-                continue
-
-            with open(book_path, 'w', encoding='utf-8-sig') as f:
-                f.write(raw)
-
-            print(f"    Saved: books/txt/{book_filename}")
-            time.sleep(SLEEP_SEC)
-
-        save_char_count(conn, book_id, len(raw))
+        time.sleep(SLEEP_SEC)
 
         if len(raw) < 200:
             print(f"    SKIPPED: text too short ({len(raw)} chars).")
