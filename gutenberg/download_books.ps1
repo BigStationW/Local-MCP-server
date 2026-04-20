@@ -4,13 +4,12 @@ $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvDir    = Join-Path $ScriptDir "..\venv"
 
 $BooksDir       = Join-Path $ScriptDir "books"
-$BooksTxtDir    = Join-Path $BooksDir  "txt"
-$BooksIndexDir  = Join-Path $BooksDir  "index"
 
 $ManticoreDir  = Join-Path $ScriptDir "manticore"
 $ManticoreBin  = Join-Path $ManticoreDir "bin\searchd.exe"
 $ManticoreConf = Join-Path $ManticoreDir "manticore.conf"
-$ManticoreData = $BooksIndexDir
+$ManticoreData = $BooksDir
+
 $ManticoreLogs = Join-Path $ManticoreDir "logs"
 $ManticoreZip  = Join-Path $ScriptDir "manticore_pkg.zip"
 
@@ -26,8 +25,8 @@ Write-Host "This will:"
 Write-Host "  1. Ask which languages to download"
 Write-Host "  2. Download and extract Manticore Search (zip, no installer)"
 Write-Host "  3. Start it as a background process (no service needed)"
-Write-Host "  4. Download the Gutenberg corpus (plain text only) -> books\txt"
-Write-Host "  5. Index all books into Manticore (index files)    -> books\index"
+Write-Host "  4. Download the Gutenberg corpus"
+Write-Host "  5. Index all books into Manticore (index files)    -> books"
 Write-Host ""
 Read-Host "Press Enter to continue"
 
@@ -65,8 +64,7 @@ Write-Host ""
 Write-Host "[2/5] Setting up Manticore Search..."
 Write-Host ""
 
-foreach ($dir in @($ManticoreDir, $ManticoreData, $ManticoreLogs,
-                   $BooksDir, $BooksTxtDir, $BooksIndexDir)) {
+foreach ($dir in @($ManticoreDir, $ManticoreData, $ManticoreLogs, $BooksDir)) {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 }
 
@@ -134,7 +132,6 @@ searchd {
 
 Write-Host "  Config written."
 Write-Host "  Index files : $ManticoreData"
-Write-Host "  Book txt    : $BooksTxtDir"
 
 # Kill any leftover searchd from a previous run
 $stale = Get-Process -Name "searchd" -ErrorAction SilentlyContinue
@@ -234,8 +231,6 @@ Write-Host "  Index script will use languages: $($Languages -join ', ')"
 Write-Host ""
 Write-Host "[5/5] Starting indexer"
 Write-Host ""
-
-$env:GUTENBERG_TXT_DIR = $BooksTxtDir
 
 # We only run this once because the Python script natively prompts for limits.
 & $PythonExe $IndexScript
