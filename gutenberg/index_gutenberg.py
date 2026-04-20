@@ -482,11 +482,50 @@ def main():
         help='Run full setup (download Manticore, start it, then index). '
              'Used by download_books.bat.'
     )
+    parser.add_argument(
+        '--serve', action='store_true',
+        help='Start Manticore and keep it running (no indexing). '
+             'Used by launch_gutenberg.bat.'
+    )
     args = parser.parse_args()
 
     searchd_proc = None
 
-    if args.setup:
+    if args.serve:
+        # Just start Manticore and keep it running (for launch_gutenberg.bat)
+        print()
+        print("============================================================")
+        print("  PROJECT GUTENBERG - STARTING MANTICORE")
+        print("============================================================")
+        print()
+        
+        searchd_proc = setup_manticore()
+        
+        print("============================================================")
+        print("  MANTICORE SEARCH IS RUNNING")
+        print("============================================================")
+        print()
+        print(f"  Listening on {MANTICORE_HOST}:{MANTICORE_PORT}")
+        print("  Keep this window open while using the MCP tools.")
+        print()
+        print("  Press Ctrl+C or close this window to stop.")
+        print()
+        
+        try:
+            # Keep alive until interrupted
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n  Shutting down...")
+        
+        if searchd_proc and searchd_proc.poll() is None:
+            searchd_proc.kill()
+            searchd_proc.wait(timeout=5)
+        
+        print("  [OK] Stopped.")
+        sys.exit(0)
+
+    elif args.setup:
         # Full ps1-equivalent flow
         searchd_proc = setup_manticore()
     else:

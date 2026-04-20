@@ -19,6 +19,8 @@ if not exist "%VENV_DIR%" (
     exit /b 1
 )
 
-"%VENV_DIR%\Scripts\python.exe" "%SCRIPT_DIR%\index_gutenberg.py"
+REM No --setup flag: just check MCP and connect
+"%VENV_DIR%\Scripts\python.exe" "%SCRIPT_DIR%\index_gutenberg.py" --serve
 
 endlocal
+pause
