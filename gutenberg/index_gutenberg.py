@@ -403,23 +403,21 @@ def _ssl_ctx():
 
 def build_zip_urls(book_id):
     sid = str(book_id)
-    urls = []
+    urls =[]
 
-    if book_id >= 100:
-        urls.append(f"https://www.gutenberg.org/cache/epub/{sid}/pg{sid}.txt.utf8")
-
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}-0.txt")
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}-8.txt")
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}.txt")
-
+    # Determine the directory path for mirrors (e.g., 2147 -> "2/1/4/2147")
     if len(sid) == 1:
         dir_path = f"0/{sid}"
     else:
         dir_path = "/".join(sid[:-1]) + f"/{sid}"
 
-    urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}-0.zip")
-    urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}-8.zip")
-    urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}.zip")
+    # 2. ODU High-Speed Mirror
+    urls.append(f"https://mirror.cs.odu.edu/gutenberg/{dir_path}/{sid}.txt")
+    urls.append(f"https://mirror.cs.odu.edu/gutenberg/{dir_path}/{sid}.zip")
+    urls.append(f"https://mirror.cs.odu.edu/gutenberg/{dir_path}/{sid}-0.txt")
+    urls.append(f"https://mirror.cs.odu.edu/gutenberg/{dir_path}/{sid}-0.zip")
+    urls.append(f"https://mirror.cs.odu.edu/gutenberg/{dir_path}/{sid}-8.txt")
+    urls.append(f"https://mirror.cs.odu.edu/gutenberg/{dir_path}/{sid}-8.zip")
 
     return urls
 
@@ -461,24 +459,39 @@ def download_text(book_id):
     hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
     ctx = _ssl_ctx()
 
-    for url in build_zip_urls(book_id):
+    # The list of URLs is now much longer and more robust
+    urls_to_try = build_zip_urls(book_id)
+
+    for url in urls_to_try:
         try:
             req = urllib.request.Request(url, headers=hdrs)
             with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+                # Check for HTTP errors on the response itself
+                if r.status >= 400:
+                    print(f"    -> FAILED with HTTP {r.status}: {url}")
+                    continue # Skip to the next URL
+
                 data = r.read()
+
+            # If we get here, the download was successful
+            print(f"    -> SUCCESS: {url}")
 
             if url.endswith(".zip"):
                 result = _decode_zip(data, book_id)
                 if result:
                     return result
             else:
-                hint = "windows-1252" if url.endswith("-8.txt") else "utf-8"
+                hint = "windows-1252" if "-8.txt" in url else "utf-8"
                 return _decode_raw_text(data, hint, book_id)
 
-        except Exception:
-            continue
+        except Exception as e:
+            # This block now prints the URL and the specific error
+            print(f"    -> FAILED with error: {e}")
+            print(f"       URL: {url}")
+            continue # This continue is important to move to the next URL
 
-    print(f"  WARNING: all URLs failed for book {book_id}")
+    # This message now appears only after ALL URLs have failed
+    print(f"  [WARNING] All URLs failed for book {book_id}")
     return None
 
 # ============================================================
