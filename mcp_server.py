@@ -360,14 +360,16 @@ async def gutenberg_search(
         return "Empty query."
 
     def _make_sql(fts_expr: str) -> str:
-        fts_safe = fts_expr.replace("'", "''")
+        body_part = f"({fts_expr})" if author or category else fts_expr
+        author_part = f" @author {author.replace(chr(39), '')}" if author else ""
+        category_part = f" @bookshelves {category.replace(chr(39), '')}" if category else ""
+        full_match = f"@body {body_part}{author_part}{category_part}"
+        fts_safe = full_match.replace("'", "''")
         lang_filter = f" AND language='{language.replace(chr(39), '')[:5]}'" if language else ""
-        author_filter = f" AND author LIKE '%{author.replace(chr(39), '')}%'" if author else ""
-        category_filter = f" AND bookshelves LIKE '%{category.replace(chr(39), '')}%'" if category else ""
         return (
             "SELECT book_id, title, author, language, bookshelves, start_char, body "
             "FROM gutenberg_paragraphs "
-            f"WHERE MATCH('{fts_safe}'){lang_filter}{author_filter}{category_filter} "
+            f"WHERE MATCH('{fts_safe}'){lang_filter} "
             f"LIMIT {int(offset)}, {int(max_results)} "
             "OPTION ranker=proximity_bm25, field_weights=(body=10,title=1)"
         )
@@ -457,9 +459,7 @@ async def gutenberg_search(
         end_char = row['start_char'] + len(snippet)
 
         bookshelves = (row.get('bookshelves') or '').strip()
-        # Remove "Category: " prefix from each category entry
-        cleaned_bookshelves = re.sub(r'Category:\s*', '', bookshelves)
-        cat_str = f"   categories: {cleaned_bookshelves}\n" if cleaned_bookshelves else ""
+        cat_str = f"   categories: {bookshelves}\n" if bookshelves else ""
         lines.append(
             f"{i}. {row['title']} by {row['author']}\n"
             f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
