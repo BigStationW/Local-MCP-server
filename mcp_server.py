@@ -295,6 +295,38 @@ def _manticore_conn():
         charset="utf8mb4", connect_timeout=5,
     )
 
+MAX_EXPAND = 300  # max chars to expand beyond the fragment edge in either direction
+
+def _sentence_bounds(text: str, frag_start: int, frag_end: int):
+    # --- Backward: find sentence start ---
+    prefix = text[:frag_start]
+    m_list = list(re.finditer(r'[.!?]["\u2019\u201d\']?\s+', prefix))
+    if m_list and (frag_start - m_list[-1].end()) <= MAX_EXPAND:
+        sent_start = m_list[-1].end()
+        prefix_truncated = False
+    else:
+        # Fall back: trim to MAX_EXPAND chars, snap to word boundary
+        cut = max(0, frag_start - MAX_EXPAND)
+        space = text.find(' ', cut)
+        sent_start = space + 1 if (0 < space < frag_start) else frag_start
+        prefix_truncated = (sent_start > 0)
+
+    # --- Forward: find sentence end ---
+    suffix = text[frag_end:]
+    m = re.search(r'[.!?]["\u2019\u201d\']?(?=\s|$)', suffix)
+    if m and m.end() <= MAX_EXPAND:
+        sent_end = frag_end + m.end()
+        suffix_truncated = False
+    else:
+        # Fall back: trim to MAX_EXPAND chars, snap to word boundary
+        cut = frag_end + MAX_EXPAND
+        cut = min(cut, len(text))
+        space = text.rfind(' ', frag_end, cut)
+        sent_end = space if space > frag_end else cut
+        suffix_truncated = True
+
+    return sent_start, sent_end, prefix_truncated, suffix_truncated
+
 # ---------------------------------------------------------------------------
 # BASIC TOOLS
 # ---------------------------------------------------------------------------
@@ -528,7 +560,6 @@ async def gutenberg_search(
             fragments = re.split(r'\s*\.\.\.\s*', snippet)
             result_parts = []
             search_pos = 0
-            is_first_fragment = True
             last_end_pos = 0
 
             for frag in fragments:
@@ -538,19 +569,22 @@ async def gutenberg_search(
 
                 pos = body.find(clean_frag[:50], search_pos)
                 if pos >= 0:
-                    abs_pos = para_start + pos
-                    display_pos = para_start if is_first_fragment else abs_pos
-                    result_parts.append(f"[{display_pos}] {frag}")
-                    last_end_pos = pos + len(clean_frag)  # end of this fragment in body
-                    search_pos = last_end_pos
-                    is_first_fragment = False
+                    frag_end_in_body = pos + len(clean_frag)
+
+                    sent_start, sent_end, pre_trunc, suf_trunc = _sentence_bounds(body, pos, frag_end_in_body)
+
+                    prefix_text = ("… " if pre_trunc else "") + body[sent_start:pos]
+                    suffix_text  = body[frag_end_in_body:sent_end] + (" …" if suf_trunc else "")
+                    full_display = prefix_text + frag + suffix_text
+
+                    result_parts.append(f"[{para_start + sent_start}] {full_display}")
+                    last_end_pos = sent_end
+                    search_pos = frag_end_in_body
                 else:
-                    display_pos = para_start if is_first_fragment else "?"
-                    result_parts.append(f"[{display_pos}] {frag}")
-                    is_first_fragment = False
+                    result_parts.append(f"[?] {frag}")
 
             end_char = para_start + last_end_pos
-            snippet = " ".join(result_parts)
+            snippet = " [...] ".join(result_parts)
 
         # 1. Split into lines, strip leading/trailing spaces from each, drop empty lines
         clean_lines = [line.strip() for line in snippet.splitlines() if line.strip()]
