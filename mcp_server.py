@@ -323,17 +323,16 @@ async def gutenberg_search(
     proximity: int = 50,
     author: str = None,
     category: str = None,
+    ranker: str = "proximity_bm25",
 ) -> str:
     """
     Search the full prose text of all indexed Gutenberg books by concrete word clusters.
     Returns highlighted paragraphs with book IDs, and start_char offsets
     ready to pass directly to read_book_content.
 
-    Results are ranked by proximity_bm25: a combined score of
-      • BM25  — rewards rare words that appear frequently in the paragraph
-      • Proximity — rewards paragraphs where the query words sit close together
-    Body text is weighted 10× higher than title text.
-    The first result is therefore the strongest match; quality degrades toward the end.
+    Results are ranked according to the `ranker` option. The default (proximity_bm25)
+    combines BM25 term-frequency relevance with word-proximity scoring and weights
+    body text 10× higher than title text.
 
     Args:
         query:       Start with complete sentences, then simplify if no results appear.
@@ -348,30 +347,54 @@ async def gutenberg_search(
         category:    Optional. Filter by bookshelf category (case-insensitive partial match).
                      e.g. "Historical Fiction" or "Philosophy". Matches against
                      Category:-prefixed entries in the Bookshelves field.
+        ranker:      Ranking algorithm. Options:
+                       "proximity_bm25" (default) — best for most queries; rewards rare
+                           words appearing frequently and close together.
+                       "bm25"           — pure term-frequency relevance, ignores proximity;
+                           good for broad thematic searches where word order doesn't matter.
+                       "sph04"          — like proximity_bm25 but also rewards exact phrase
+                           matches; best when your query is a known exact phrase or title.
+                       "wordcount"      — ranks by raw count of matched query words in the
+                           paragraph; good for finding dense passages on a topic.
+                       "tf_idf"         — classic TF-IDF; similar to bm25 but older formula.
+                       "none"           — no ranking (fastest); returns results in index order.
 
     Workflow:
         gutenberg_search(query="...")                          ← first page
         gutenberg_search(query="...", offset=10)              ← next page
         read_book_content(book_id=..., start_char=...)
     """
+    VALID_RANKERS = {"proximity_bm25", "bm25", "sph04", "wordcount", "tf_idf", "none"}
+    if ranker not in VALID_RANKERS:
+        return (
+            f"Invalid ranker '{ranker}'. Choose from: {', '.join(sorted(VALID_RANKERS))}.\n"
+            "Default is 'proximity_bm25'."
+        )
+
     clean_query = re.sub(r'[^\w\s]', '', query)
     words = [w.strip() for w in clean_query.split() if w.strip()]
     if not words:
         return "Empty query."
 
-    def _make_sql(fts_expr: str) -> str:
+    def _make_sql(fts_expr: str, use_ranker: str) -> str:
         body_part = f"({fts_expr})" if author or category else fts_expr
         author_part = f" @author {author.replace(chr(39), '')}" if author else ""
         category_part = f" @bookshelves {category.replace(chr(39), '')}" if category else ""
         full_match = f"@body {body_part}{author_part}{category_part}"
         fts_safe = full_match.replace("'", "''")
         lang_filter = f" AND language='{language.replace(chr(39), '')[:5]}'" if language else ""
+
+        # HIGHLIGHT() strips HTML-like markers by default; use ** for plain-text readability
+        highlight_opts = "before_match='**', after_match='**', limit=400, around=5"
+
+        # field_weights only meaningful for rankers that use them; harmless for others
         return (
-            "SELECT book_id, title, author, language, bookshelves, start_char, body "
-            "FROM gutenberg_paragraphs "
+            f"SELECT book_id, title, author, language, bookshelves, start_char, "
+            f"HIGHLIGHT({{{highlight_opts}}}, 'body') AS snippet "
+            f"FROM gutenberg_paragraphs "
             f"WHERE MATCH('{fts_safe}'){lang_filter} "
             f"LIMIT {int(offset)}, {int(max_results)} "
-            "OPTION ranker=proximity_bm25, field_weights=(body=10,title=1)"
+            f"OPTION ranker={use_ranker}, field_weights=(body=10,title=1)"
         )
 
     proximity_fts = (
@@ -384,7 +407,7 @@ async def gutenberg_search(
         conn = _manticore_conn()
         cur = conn.cursor(_pymysql.cursors.DictCursor)
 
-        cur.execute(_make_sql(proximity_fts))
+        cur.execute(_make_sql(proximity_fts, ranker))
         rows = cur.fetchall()
         cur.execute("SHOW META")
         meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
@@ -392,7 +415,7 @@ async def gutenberg_search(
         used_fallback = False
 
         if not rows and len(words) > 1:
-            cur.execute(_make_sql(fallback_fts))
+            cur.execute(_make_sql(fallback_fts, ranker))
             rows = cur.fetchall()
             cur.execute("SHOW META")
             meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
@@ -440,29 +463,27 @@ async def gutenberg_search(
     last  = offset + len(rows)
     lines = [
         f"Found {total_found} prose match(es) for '{query}' "
-        f"(language={lang_display}, proximity={proximity}) — displaying {first}–{last}:"
+        f"(language={lang_display}, proximity={proximity}, ranker={ranker}) — displaying {first}–{last}:"
         f"{fallback_note}\n"
     ]
 
     for i, row in enumerate(rows, 1):
-        body = (row.get("body") or "").strip()
+        snippet = (row.get("snippet") or "").strip()
 
-        if len(body) <= 400:
-            snippet = body
-        else:
-            match = re.search(r'[.!?]', body[400:])
-            if match:
-                snippet = body[:400 + match.start() + 1]
+        # HIGHLIGHT() may return empty for some edge-case paragraphs; fall back gracefully
+        if not snippet:
+            body = (row.get("body") or "").strip()
+            if len(body) <= 400:
+                snippet = body
             else:
-                snippet = body[:400].rsplit(' ', 1)[0] + '…'
-
-        end_char = row['start_char'] + len(snippet)
+                match = re.search(r'[.!?]', body[400:])
+                snippet = body[:400 + match.start() + 1] if match else body[:400].rsplit(' ', 1)[0] + '…'
 
         bookshelves = (row.get('bookshelves') or '').strip()
         cat_str = f"   categories: {bookshelves}\n" if bookshelves else ""
         lines.append(
             f"{i}. {row['title']} by {row['author']}\n"
-            f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
+            f"   book_id: {row['book_id']} | start_char: {row['start_char']}\n"
             f"{cat_str}"
             f"   Match: {snippet}\n\n"
         )
@@ -473,11 +494,11 @@ async def gutenberg_search(
     next_steps = ["\nNext steps:"]
     if next_offset < total_found:
         next_steps.append(
-            f"  • Continue  → gutenberg_search(query='{query}', offset={next_offset}, max_results={max_results})"
+            f"  • Continue  → gutenberg_search(query='{query}', offset={next_offset}, max_results={max_results}, ranker='{ranker}')"
         )
     if offset > 0:
         next_steps.append(
-            f"  • Go back   → gutenberg_search(query='{query}', offset={prev_offset}, max_results={max_results})"
+            f"  • Go back   → gutenberg_search(query='{query}', offset={prev_offset}, max_results={max_results}, ranker='{ranker}')"
         )
     next_steps.append(
         "  • Read text → read_book_content(book_id=<book_id>, start_char=<start_char>)"
