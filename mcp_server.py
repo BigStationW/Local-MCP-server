@@ -407,7 +407,7 @@ async def gutenberg_search(
         highlight_opts = "before_match='**', after_match='**', limit=500, around=20"
 
         return (
-            f"SELECT book_id, title, author, language, bookshelves, start_char, "
+            f"SELECT book_id, title, author, language, bookshelves, start_char, body, "
             f"HIGHLIGHT({{{highlight_opts}}}, 'body') AS snippet "
             f"FROM gutenberg_paragraphs "
             f"WHERE MATCH('{fts_safe}'){lang_filter} "
@@ -508,18 +508,50 @@ async def gutenberg_search(
 
     for i, row in enumerate(rows, 1):
         snippet = (row.get("snippet") or "").strip()
+        body = row.get("body") or ""
+        para_start = row['start_char']
 
         # HIGHLIGHT() may return empty for very short paragraphs; degrade gracefully
         if not snippet:
-            body = (row.get("body") or "").strip()
-            if len(body) <= 400:
-                snippet = body
+            body_text = (row.get("body") or "").strip()
+            if len(body_text) <= 500:
+                snippet = f"[{para_start}] {body_text}"
             else:
-                m = re.search(r'[.!?]', body[400:])
-                snippet = body[:400 + m.start() + 1] if m else body[:400].rsplit(' ', 1)[0] + '…'
+                m = re.search(r'[.!?]', body_text[500:])
+                end_pos = 500 + m.start() + 1 if m else 500
+                snippet = f"[{para_start}] {body_text[:end_pos].rsplit(' ', 1)[0]}… [{para_start + end_pos}]"
+        else:
+            # Replace ... with character positions
+            fragments = re.split(r'\s*\.\.\.\s*', snippet)
+            result_parts = []
+            search_pos = 0
+            is_first_fragment = True  # Track actual first fragment
+            
+            for frag in fragments:
+                # Remove ** markers to find position in original body
+                clean_frag = frag.replace('**', '').strip()
+                if not clean_frag:
+                    continue
+                    
+                # Find fragment in body text
+                pos = body.find(clean_frag[:50], search_pos)  # Use first 50 chars for matching
+                if pos >= 0:
+                    abs_pos = para_start + pos
+                    # For first fragment, use paragraph start; for rest, use actual position
+                    display_pos = para_start if is_first_fragment else abs_pos
+                    result_parts.append(f"[{display_pos}] {frag}")
+                    search_pos = pos + len(clean_frag)
+                    is_first_fragment = False  # No longer first after this
+                else:
+                    # Fallback if can't find position
+                    display_pos = para_start if is_first_fragment else "?"
+                    result_parts.append(f"[{display_pos}] {frag}")
+                    is_first_fragment = False
+            
+            snippet = " ".join(result_parts)
 
         # 1. Split into lines, strip leading/trailing spaces from each, drop empty lines
-        clean_lines =[line.strip() for line in snippet.splitlines() if line.strip()]
+        clean_lines = [line.strip() for line in snippet.splitlines() if line.strip()]
         # 2. Join them back with a newline and exactly 3 spaces
         snippet = "\n   ".join(clean_lines)
 
