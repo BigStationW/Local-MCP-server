@@ -404,7 +404,7 @@ async def gutenberg_search(
         fts_safe = _escape_fts(full_match)
         lang_filter = f" AND language='{_escape_fts(language[:5])}'" if language else ""
 
-        highlight_opts = "before_match='**', after_match='**', limit=400, around=5"
+        highlight_opts = "before_match='**', after_match='**', limit=500, around=20"
 
         return (
             f"SELECT book_id, title, author, language, bookshelves, start_char, "
@@ -415,10 +415,6 @@ async def gutenberg_search(
             f"OPTION ranker={use_ranker}, field_weights=(body=10,title=1)"
         )
 
-    # Three query tiers, tried in order:
-    #   1. Raw query  — operators intact, exactly as the caller wrote it.
-    #   2. NEAR/N     — plain words only, proximity-constrained (good middle ground).
-    #   3. Plain AND  — plain words only, no proximity constraint (broadest fallback).
     raw_fts       = _escape_fts(query)
     proximity_fts = (
         plain_words[0] if len(plain_words) == 1
@@ -426,8 +422,8 @@ async def gutenberg_search(
     )
     fallback_fts  = " ".join(plain_words)
 
-    used_fallback  = False   # True  → fell back to NEAR or plain-AND
-    fallback_label = ""      # human-readable description of which tier was used
+    used_fallback  = False
+    fallback_label = ""
 
     try:
         conn = _manticore_conn()
