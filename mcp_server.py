@@ -378,7 +378,9 @@ async def gutenberg_search(
         gutenberg_search(query="...", offset=10)              ← next page
         read_book_content(book_id=..., start_char=...)
     """
+    SNIPPET_LENGTH = 500
     VALID_RANKERS = {"proximity_bm25", "bm25", "sph04", "wordcount", "none"}
+
     if ranker not in VALID_RANKERS:
         return (
             f"Invalid ranker '{ranker}'. Choose from: {', '.join(sorted(VALID_RANKERS))}.\n"
@@ -404,7 +406,7 @@ async def gutenberg_search(
         fts_safe = _escape_fts(full_match)
         lang_filter = f" AND language='{_escape_fts(language[:5])}'" if language else ""
 
-        highlight_opts = "before_match='**', after_match='**', limit=500, around=20"
+        highlight_opts = f"before_match='**', after_match='**', limit={SNIPPET_LENGTH}, around=20"
 
         return (
             f"SELECT book_id, title, author, language, bookshelves, start_char, body, "
@@ -514,11 +516,11 @@ async def gutenberg_search(
         # HIGHLIGHT() may return empty for very short paragraphs; degrade gracefully
         if not snippet:
             body_text = (row.get("body") or "").strip()
-            if len(body_text) <= 500:
+            if len(body_text) <= SNIPPET_LENGTH:
                 snippet = f"[{para_start}] {body_text}"
             else:
-                m = re.search(r'[.!?]', body_text[500:])
-                end_pos = 500 + m.start() + 1 if m else 500
+                m = re.search(r'[.!?]', body_text[SNIPPET_LENGTH:])
+                end_pos = SNIPPET_LENGTH + m.start() + 1 if m else SNIPPET_LENGTH
                 snippet = f"[{para_start}] {body_text[:end_pos].rsplit(' ', 1)[0]}… [{para_start + end_pos}]"
         else:
             # Replace ... with character positions
