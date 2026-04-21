@@ -518,38 +518,38 @@ async def gutenberg_search(
             body_text = (row.get("body") or "").strip()
             if len(body_text) <= SNIPPET_LENGTH:
                 snippet = f"[{para_start}] {body_text}"
+                end_char = para_start + len(body_text)
             else:
                 m = re.search(r'[.!?]', body_text[SNIPPET_LENGTH:])
                 end_pos = SNIPPET_LENGTH + m.start() + 1 if m else SNIPPET_LENGTH
                 snippet = f"[{para_start}] {body_text[:end_pos].rsplit(' ', 1)[0]}… [{para_start + end_pos}]"
+                end_char = para_start + end_pos
         else:
-            # Replace ... with character positions
             fragments = re.split(r'\s*\.\.\.\s*', snippet)
             result_parts = []
             search_pos = 0
-            is_first_fragment = True  # Track actual first fragment
-            
+            is_first_fragment = True
+            last_end_pos = 0
+
             for frag in fragments:
-                # Remove ** markers to find position in original body
                 clean_frag = frag.replace('**', '').strip()
                 if not clean_frag:
                     continue
-                    
-                # Find fragment in body text
-                pos = body.find(clean_frag[:50], search_pos)  # Use first 50 chars for matching
+
+                pos = body.find(clean_frag[:50], search_pos)
                 if pos >= 0:
                     abs_pos = para_start + pos
-                    # For first fragment, use paragraph start; for rest, use actual position
                     display_pos = para_start if is_first_fragment else abs_pos
                     result_parts.append(f"[{display_pos}] {frag}")
-                    search_pos = pos + len(clean_frag)
-                    is_first_fragment = False  # No longer first after this
+                    last_end_pos = pos + len(clean_frag)  # end of this fragment in body
+                    search_pos = last_end_pos
+                    is_first_fragment = False
                 else:
-                    # Fallback if can't find position
                     display_pos = para_start if is_first_fragment else "?"
                     result_parts.append(f"[{display_pos}] {frag}")
                     is_first_fragment = False
-            
+
+            end_char = para_start + last_end_pos
             snippet = " ".join(result_parts)
 
         # 1. Split into lines, strip leading/trailing spaces from each, drop empty lines
@@ -561,7 +561,7 @@ async def gutenberg_search(
         cat_str = f"   categories: {bookshelves}\n" if bookshelves else ""
         lines.append(
             f"{i}. {row['title']} by {row['author']}\n"
-            f"   book_id: {row['book_id']} | start_char: {row['start_char']}\n"
+            f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
             f"{cat_str}"
             f"   Match: {snippet}\n\n"
         )
