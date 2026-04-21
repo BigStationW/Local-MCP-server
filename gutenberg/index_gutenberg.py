@@ -25,7 +25,53 @@ MANTICORE_URL  = (
     "/release/x64/manticore-25.0.0-26032712-ce3c27828-x64-bundle.zip"
 )
 
-CATALOG_URL = "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv.gz"
+CUSTOM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+MIRRORS = [
+    {
+        "base": "https://www.gutenberg.org",
+        "has_catalog": True,
+        "has_cache_txt": True,
+        "has_files": True,
+        "epub_prefix": "/cache/epub",
+    },
+    {
+        "base": "https://aleph.gutenberg.org",
+        "has_catalog": False,
+        "has_cache_txt": False,
+        "has_files": True,
+        "epub_prefix": None,
+    },
+    {
+        "base": "http://gutenberg.pglaf.org",
+        "has_catalog": True,
+        "has_cache_txt": True,
+        "has_files": True,
+        "epub_prefix": "/cache/epub",
+    },
+    {
+        "base": "https://mirror.cs.odu.edu/gutenberg-epub",
+        "has_catalog": False,
+        "has_cache_txt": True,   # has pg{id}.txt.utf8 but at /{id}/pg{id}.txt.utf8
+        "has_files": False,
+        "epub_prefix": "",       # book id directly under base, no subfolder
+    },
+    {
+        "base": "http://mirrors.xmission.com/gutenberg",
+        "has_catalog": False,    # cache folder exists but feeds not synced
+        "has_cache_txt": False,
+        "has_files": True,
+        "has_files_simple": True,   # only {id}.zip and {id}.txt exist, no /files/, no -0/-8
+        "epub_prefix": None,
+    },
+]
+
+CATALOG_URLS = [
+    f"{m['base']}{m['epub_prefix']}/feeds/pg_catalog.csv.gz"
+    for m in MIRRORS if m["has_catalog"]
+]
 
 UNICODE_REPLACEMENTS = [
     ('\u2019', "'"), ('\u2018', "'"), ('\u02bc', "'"),
@@ -131,7 +177,7 @@ def _download_manticore():
     ctx.verify_mode = ssl.CERT_NONE
 
     try:
-        req = urllib.request.Request(MANTICORE_URL, headers=hdrs)
+        req = urllib.request.Request(MANTICORE_URL, headers=CUSTOM_HEADERS) 
         with urllib.request.urlopen(req, timeout=120, context=ctx) as r:
             data = r.read()
         with open(MANTICORE_ZIP, 'wb') as f:
@@ -239,6 +285,20 @@ def find_mcp_port(pid):
 
     return None
 
+# Track which base hosts are blocked for this session
+_blocked_hosts = set()
+
+def _mark_host_blocked(url):
+    for m in MIRRORS:
+        if url.startswith(m["base"]):
+            if m["base"] not in _blocked_hosts:
+                print(f"  [SESSION] Blocking host for remainder of session: {m['base']}")
+            _blocked_hosts.add(m["base"])
+            return
+
+def _is_blocked(url):
+    return any(url.startswith(base) for base in _blocked_hosts)
+
 # ============================================================
 # DB HELPERS
 # ============================================================
@@ -334,36 +394,53 @@ def load_catalog_bytes():
     os.makedirs(BOOKS_BASE_DIR, exist_ok=True)
     catalog_path = os.path.join(BOOKS_BASE_DIR, "pg_catalog.csv")
 
-    if os.path.exists(catalog_path):
-        # Check how old the file is (in seconds)
-        file_age_seconds = time.time() - os.path.getmtime(catalog_path)
-        
-        # 86400 seconds = 24 hours
-        if file_age_seconds < 86400:
-            print(f"  Using cached catalog (less than 24h old): {catalog_path}")
-            with open(catalog_path, 'rb') as f:
-                return f.read()
-        else:
-            print(f"  Cached catalog is older than 24 hours. Updating...")
-
-    print(f"  Downloading catalog from {CATALOG_URL} ...")
-    hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
+    # --- PART 1: TRY TO DOWNLOAD FRESH DATA ---
+    print("  Attempting to download fresh catalog...")
+    
+    # Standard SSL context setup
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    req = urllib.request.Request(CATALOG_URL, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
-        raw_gz = r.read()
+    for url in CATALOG_URLS:
+        try:
+            print(f"    Trying mirror: {url} ...")
+            req = urllib.request.Request(url, headers=CUSTOM_HEADERS)
+            with urllib.request.urlopen(req, timeout=25, context=ctx) as r:
+                raw_gz = r.read()
 
-    print(f"  Downloaded {len(raw_gz):,} bytes. Decompressing...")
-    csv_bytes = gzip.decompress(raw_gz)
+            print(f"    Success! Downloaded {len(raw_gz):,} bytes. Decompressing...")
+            csv_bytes = gzip.decompress(raw_gz)
 
-    with open(catalog_path, 'wb') as f:
-        f.write(csv_bytes)
+            # Save it so we have a fresh "old" copy for next time
+            with open(catalog_path, 'wb') as f:
+                f.write(csv_bytes)
 
-    print(f"  Catalog saved to {catalog_path}")
-    return csv_bytes
+            print(f"    [OK] Catalog updated and saved.")
+            return csv_bytes
+
+        except Exception as e:
+            # We don't exit yet, we just print the warning and try the next mirror
+            print(f"    WARNING: Mirror failed: {e}")
+            continue
+
+    # --- PART 2: FALLBACK TO LOCAL CACHE ---
+    if os.path.exists(catalog_path):
+        print("\n  [!] ALL DOWNLOADS FAILED.")
+        print(f"  [!] Falling back to existing local catalog: {catalog_path}")
+        
+        # Calculate age just for the user's information
+        file_age_days = (time.time() - os.path.getmtime(catalog_path)) / 86400
+        print(f"      (This local file is {file_age_days:.1f} days old)")
+        
+        with open(catalog_path, 'rb') as f:
+            return f.read()
+
+    # --- PART 3: TOTAL FAILURE ---
+    print("\n  CRITICAL ERROR: Fresh download failed AND no local catalog was found.")
+    print("  Please check your internet connection or download the catalog manually.")
+    input("  Press Enter to exit...")
+    sys.exit(1)
 
 def parse_and_filter_catalog(csv_bytes, wanted_langs):
     reader = csv.DictReader(io.StringIO(csv_bytes.decode('utf-8', errors='replace')))
@@ -392,25 +469,41 @@ def _ssl_ctx():
 
 def build_zip_urls(book_id):
     sid = str(book_id)
-    urls = []
-
-    if book_id >= 100:
-        urls.append(f"https://www.gutenberg.org/cache/epub/{sid}/pg{sid}.txt.utf8")
-
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}-0.txt")
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}-8.txt")
-    urls.append(f"https://www.gutenberg.org/files/{sid}/{sid}.txt")
 
     if len(sid) == 1:
         dir_path = f"0/{sid}"
     else:
         dir_path = "/".join(sid[:-1]) + f"/{sid}"
 
-    urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}-0.zip")
-    urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}-8.zip")
-    urls.append(f"https://aleph.gutenberg.org/{dir_path}/{sid}.zip")
+    urls = []
+    for m in MIRRORS:
+        base = m["base"]
+        simple_files_only = m.get("has_files_simple", False)
 
-    return urls
+        if m["has_cache_txt"]:
+            prefix = m["epub_prefix"]
+            if prefix == "":
+                # ODU: try modern pg{id}.txt first, then legacy pg{id}.txt.utf8
+                urls.append(f"{base}/{sid}/pg{sid}.txt")
+                urls.append(f"{base}/{sid}/pg{sid}.txt.utf8")
+            elif book_id >= 100:
+                urls.append(f"{base}{prefix}/{sid}/pg{sid}.txt.utf8")
+
+        if m["has_files"]:
+            if simple_files_only:
+                # xmission: no /files/ subfolder, no -0/-8 variants
+                urls.append(f"{base}/{dir_path}/{sid}.zip")
+                urls.append(f"{base}/{dir_path}/{sid}.txt")
+            else:
+                # Full mirrors (gutenberg.org, pglaf, aleph): all variants
+                urls.append(f"{base}/files/{sid}/{sid}-0.txt")
+                urls.append(f"{base}/files/{sid}/{sid}-8.txt")
+                urls.append(f"{base}/files/{sid}/{sid}.txt")
+                urls.append(f"{base}/{dir_path}/{sid}-0.zip")
+                urls.append(f"{base}/{dir_path}/{sid}-8.zip")
+                urls.append(f"{base}/{dir_path}/{sid}.zip")
+
+    return [u for u in urls if not _is_blocked(u)]
 
 def _decode_raw_text(data, hint=None, book_id=None):
     header = data[:2000].decode("ascii", errors="ignore")
@@ -447,27 +540,92 @@ def _decode_zip(data, book_id=None):
     return None
 
 def download_text(book_id):
-    hdrs = {"User-Agent": "gutenberg-mcp-indexer/1.0"}
     ctx = _ssl_ctx()
 
     for url in build_zip_urls(book_id):
+        if _is_blocked(url):
+            print(f"    [BLOCKED] {url}")
+            print(f"              Host blocked this session, skipping.")
+            continue
+
         try:
-            req = urllib.request.Request(url, headers=hdrs)
+            req = urllib.request.Request(url, headers=CUSTOM_HEADERS)
             with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
                 data = r.read()
 
             if url.endswith(".zip"):
                 result = _decode_zip(data, book_id)
                 if result:
+                    print(f"    [SUCCESS] {url}")
+                    print(f"         Downloaded {len(data):,} bytes (zip).")
                     return result
+                else:
+                    print(f"    [FAIL] {url}")
+                    print(f"           ZIP contained no .txt file.")
             else:
                 hint = "windows-1252" if url.endswith("-8.txt") else "utf-8"
-                return _decode_raw_text(data, hint, book_id)
+                result = _decode_raw_text(data, hint, book_id)
+                print(f"    [SUCCESS] {url}")
+                print(f"         Downloaded {len(data):,} bytes.")
+                return result
 
-        except Exception:
+        except urllib.error.HTTPError as e:
+            if e.code == 403 or e.code == 404:
+                print(f"    [SKIP] {url}")
+                print(f"           HTTP {e.code} — file not found at this mirror.")
+            else:
+                print(f"    [FAIL] {url}")
+                print(f"           HTTP {e.code} {e.reason}")
             continue
 
-    print(f"  WARNING: all URLs failed for book {book_id}")
+        except urllib.error.URLError as e:
+            reason = e.reason
+            err_str = str(reason)
+
+            if hasattr(reason, 'errno'):
+                if reason.errno == 10060:
+                    print(f"    [TIMEOUT] {url}")
+                    print(f"              WinError 10060 — connection timed out, blocking host.")
+                    _mark_host_blocked(url)
+                elif reason.errno == 10054:
+                    print(f"    [RESET] {url}")
+                    print(f"            WinError 10054 — connection reset by peer (probable timeout/ban).")
+                    _mark_host_blocked(url)
+                else:
+                    print(f"    [FAIL] {url}")
+                    print(f"           URLError errno {reason.errno}: {reason}")
+            else:
+                if 'timed out' in err_str.lower():
+                    print(f"    [TIMEOUT] {url}")
+                    print(f"              {err_str} — blocking host.")
+                    _mark_host_blocked(url)
+                else:
+                    print(f"    [FAIL] {url}")
+                    print(f"           URLError: {err_str}")
+            continue
+
+        except TimeoutError:
+            print(f"    [TIMEOUT] {url}")
+            print(f"              Python TimeoutError — blocking host.")
+            _mark_host_blocked(url)
+            continue
+
+        except Exception as e:
+            err_str = str(e)
+            if '10060' in err_str:
+                print(f"    [TIMEOUT] {url}")
+                print(f"              WinError 10060 — connection timed out, blocking host.")
+                _mark_host_blocked(url)
+            elif '10054' in err_str:
+                print(f"    [RESET] {url}")
+                print(f"            WinError 10054 — connection reset by peer, blocking host.")
+                _mark_host_blocked(url)
+            else:
+                print(f"    [FAIL] {url}")
+                print(f"           {type(e).__name__}: {err_str}")
+            continue
+
+    print(f"    WARNING: all URLs failed for book {book_id}")
     return None
 
 # ============================================================
