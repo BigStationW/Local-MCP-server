@@ -335,59 +335,77 @@ async def gutenberg_search(
     body text 10× higher than title text.
 
     Args:
-        query:       Start with complete sentences, then simplify if no results appear.
+        query:       Manticore full-text query. Supports operators:
+                       - AND (default): words separated by space must all appear
+                             e.g. "propriety decorum silence"
+                       - OR:  use | between terms or phrases
+                             e.g. "vanity | pride"
+                       - Exact phrase: wrap in double quotes
+                             e.g. '"play a part"'
+                       - OR between phrases: '"play a part" | "play the comedy"'
+                       - NOT: prefix a word with - to exclude it
+                             e.g. "love -marriage"
+                       - Mix freely: '"play a part" | vanity decorum -comedy'
+                       Do NOT use SQL-style OR/AND keywords — use | and spaces instead.
+                       Start with 2-4 words; simplify if no results appear.
         language:    Two-letter code (e.g. "en", "la"). Default None (all languages).
         max_results: Number of paragraphs to return per page (default 10).
         offset:      Zero-based index of the first result to return (default 0).
                      Use offset=10 to get results 11-20, offset=20 for 21-30, etc.
-        proximity:   Max token distance between query words (default 50).
-                     Increase to 100-200 if zero results with valid words.
+        proximity:   Max token distance between query words for the NEAR fallback (default 50).
+                     Only applies when the raw query returns 0 results and Manticore
+                     retries with a NEAR/N proximity query built from plain words.
+                     Increase to 100-200 if the fallback also returns nothing.
         author:      Optional. Filter by author name (case-insensitive partial match).
-                     e.g. "Dickens" or "Carroll". Matches against the first listed author.
+                     e.g. "Dickens" or "Carroll".
         category:    Optional. Filter by bookshelf category (case-insensitive partial match).
-                     e.g. "Historical Fiction" or "Philosophy". Matches against
-                     Category:-prefixed entries in the Bookshelves field.
+                     e.g. "Historical Fiction" or "Philosophy".
         ranker:      Ranking algorithm. Options:
-                       "proximity_bm25" (default) — best for most queries; rewards rare
-                           words appearing frequently and close together.
+                       "proximity_bm25" (default) — best for targeted searches; rewards
+                           rare words appearing frequently and close together.
                        "bm25"           — pure term-frequency relevance, ignores proximity;
                            good for broad thematic searches where word order doesn't matter.
                        "sph04"          — like proximity_bm25 but also rewards exact phrase
                            matches; best when your query is a known exact phrase or title.
                        "wordcount"      — ranks by raw count of matched query words in the
                            paragraph; good for finding dense passages on a topic.
-                       "tf_idf"         — classic TF-IDF; similar to bm25 but older formula.
-                       "none"           — no ranking (fastest); returns results in index order.
+                       "none"           — no ranking (fastest); returns results in index order,
+                           giving a natural cross-section of passage types — best for
+                           stylistic exploration and finding inspiration.
 
     Workflow:
         gutenberg_search(query="...")                          ← first page
         gutenberg_search(query="...", offset=10)              ← next page
         read_book_content(book_id=..., start_char=...)
     """
-    VALID_RANKERS = {"proximity_bm25", "bm25", "sph04", "wordcount", "tf_idf", "none"}
+    VALID_RANKERS = {"proximity_bm25", "bm25", "sph04", "wordcount", "none"}
     if ranker not in VALID_RANKERS:
         return (
             f"Invalid ranker '{ranker}'. Choose from: {', '.join(sorted(VALID_RANKERS))}.\n"
             "Default is 'proximity_bm25'."
         )
 
-    clean_query = re.sub(r'[^\w\s]', '', query)
-    words = [w.strip() for w in clean_query.split() if w.strip()]
-    if not words:
+    # Extract plain words (no operators) for the NEAR/fallback path only.
+    plain_words = [w.strip() for w in re.sub(r'[^\w\s]', '', query).split() if w.strip()]
+    if not plain_words:
         return "Empty query."
 
-    def _make_sql(fts_expr: str, use_ranker: str) -> str:
-        body_part = f"({fts_expr})" if author or category else fts_expr
-        author_part = f" @author {author.replace(chr(39), '')}" if author else ""
-        category_part = f" @bookshelves {category.replace(chr(39), '')}" if category else ""
-        full_match = f"@body {body_part}{author_part}{category_part}"
-        fts_safe = full_match.replace("'", "''")
-        lang_filter = f" AND language='{language.replace(chr(39), '')[:5]}'" if language else ""
+    def _escape_fts(q: str) -> str:
+        """Escape single quotes for SQL safety. Preserve all FTS operators."""
+        return q.replace("'", "''")
 
-        # HIGHLIGHT() strips HTML-like markers by default; use ** for plain-text readability
+    def _make_sql(fts_expr: str, use_ranker: str) -> str:
+        # When author/category filters are present, wrap the body expression in parens
+        # so the field anchors (@author, @bookshelves) apply at the right level.
+        body_part = f"({fts_expr})" if author or category else fts_expr
+        author_part = f" @author {_escape_fts(author)}" if author else ""
+        category_part = f" @bookshelves {_escape_fts(category)}" if category else ""
+        full_match = f"@body {body_part}{author_part}{category_part}"
+        fts_safe = _escape_fts(full_match)
+        lang_filter = f" AND language='{_escape_fts(language[:5])}'" if language else ""
+
         highlight_opts = "before_match='**', after_match='**', limit=400, around=5"
 
-        # field_weights only meaningful for rankers that use them; harmless for others
         return (
             f"SELECT book_id, title, author, language, bookshelves, start_char, "
             f"HIGHLIGHT({{{highlight_opts}}}, 'body') AS snippet "
@@ -397,30 +415,53 @@ async def gutenberg_search(
             f"OPTION ranker={use_ranker}, field_weights=(body=10,title=1)"
         )
 
+    # Three query tiers, tried in order:
+    #   1. Raw query  — operators intact, exactly as the caller wrote it.
+    #   2. NEAR/N     — plain words only, proximity-constrained (good middle ground).
+    #   3. Plain AND  — plain words only, no proximity constraint (broadest fallback).
+    raw_fts       = _escape_fts(query)
     proximity_fts = (
-        words[0] if len(words) == 1
-        else f" NEAR/{int(proximity)} ".join(words)
+        plain_words[0] if len(plain_words) == 1
+        else f" NEAR/{int(proximity)} ".join(plain_words)
     )
-    fallback_fts = " ".join(words)
+    fallback_fts  = " ".join(plain_words)
+
+    used_fallback  = False   # True  → fell back to NEAR or plain-AND
+    fallback_label = ""      # human-readable description of which tier was used
 
     try:
         conn = _manticore_conn()
         cur = conn.cursor(_pymysql.cursors.DictCursor)
 
-        cur.execute(_make_sql(proximity_fts, ranker))
+        # Tier 1: raw query (preserves |, "", -, etc.)
+        cur.execute(_make_sql(raw_fts, ranker))
         rows = cur.fetchall()
         cur.execute("SHOW META")
         meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
         total_found = int(meta.get("total_found", len(rows)))
-        used_fallback = False
 
-        if not rows and len(words) > 1:
+        # Tier 2: NEAR/N on plain words (only when raw returned nothing and
+        #          there are multiple words to constrain)
+        if not rows and len(plain_words) > 1 and proximity_fts != raw_fts:
+            cur.execute(_make_sql(proximity_fts, ranker))
+            rows = cur.fetchall()
+            cur.execute("SHOW META")
+            meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
+            total_found = int(meta.get("total_found", len(rows)))
+            if rows:
+                used_fallback  = True
+                fallback_label = f"NEAR/{proximity} on plain words"
+
+        # Tier 3: plain AND (broadest — last resort)
+        if not rows and fallback_fts != proximity_fts:
             cur.execute(_make_sql(fallback_fts, ranker))
             rows = cur.fetchall()
             cur.execute("SHOW META")
             meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
             total_found = int(meta.get("total_found", len(rows)))
-            used_fallback = True
+            if rows:
+                used_fallback  = True
+                fallback_label = "plain AND (words may be far apart)"
 
         conn.close()
 
@@ -438,24 +479,26 @@ async def gutenberg_search(
         filter_note = ""
         if author or category:
             parts = []
-            if author: parts.append(f"author='{author}'")
+            if author:   parts.append(f"author='{author}'")
             if category: parts.append(f"category='{category}'")
             filter_note = f" with filters ({', '.join(parts)})"
         return (
-            f"No prose matches for '{query}'{filter_note} (language={lang_display}, proximity={proximity}).\n\n"
+            f"No prose matches for '{query}'{filter_note} "
+            f"(language={lang_display}, proximity={proximity}).\n\n"
             "Diagnosis:\n"
-            "  1. Try fewer words — 2 is often better than 4.\n"
-            "  2. Increase proximity= to 150 or 200.\n"
-            "  3. Use words from the middle of sentences, not headings or dialogue tags.\n"
-            f"  4. If you want a specific language, pass language='en' (or another code).\n"
-            "  5. If using author= or category=, try broadening or removing those filters."
+            "  1. Use | for OR, not the word OR: 'vanity | pride'\n"
+            "  2. Wrap exact phrases in double quotes: '\"play a part\"'\n"
+            "  3. Try fewer words — 2 is often better than 4.\n"
+            "  4. Increase proximity= to 150 or 200.\n"
+            "  5. Use words from the middle of sentences, not headings or dialogue tags.\n"
+            "  6. To restrict language, pass language='en' (or another code).\n"
+            "  7. If using author= or category=, try broadening or removing those filters."
         )
 
     fallback_note = (
-        f"\n⚠️  Proximity/{proximity} search returned 0 results — falling back to plain-match "
-        f"(all query words appear in these paragraphs, but may be far apart). "
-        f"The {len(rows)} results below are plain-match only. "
-        f"To get proximity-ranked results, try increasing proximity= to 150 or 200.\n"
+        f"\n⚠️  Raw query returned 0 results — fell back to {fallback_label}. "
+        f"The {len(rows)} results below matched on plain words. "
+        f"To use FTS operators, check the query syntax in the docstring.\n"
         if used_fallback else ""
     )
 
@@ -470,14 +513,19 @@ async def gutenberg_search(
     for i, row in enumerate(rows, 1):
         snippet = (row.get("snippet") or "").strip()
 
-        # HIGHLIGHT() may return empty for some edge-case paragraphs; fall back gracefully
+        # HIGHLIGHT() may return empty for very short paragraphs; degrade gracefully
         if not snippet:
             body = (row.get("body") or "").strip()
             if len(body) <= 400:
                 snippet = body
             else:
-                match = re.search(r'[.!?]', body[400:])
-                snippet = body[:400 + match.start() + 1] if match else body[:400].rsplit(' ', 1)[0] + '…'
+                m = re.search(r'[.!?]', body[400:])
+                snippet = body[:400 + m.start() + 1] if m else body[:400].rsplit(' ', 1)[0] + '…'
+
+        # 1. Split into lines, strip leading/trailing spaces from each, drop empty lines
+        clean_lines =[line.strip() for line in snippet.splitlines() if line.strip()]
+        # 2. Join them back with a newline and exactly 3 spaces
+        snippet = "\n   ".join(clean_lines)
 
         bookshelves = (row.get('bookshelves') or '').strip()
         cat_str = f"   categories: {bookshelves}\n" if bookshelves else ""
@@ -494,11 +542,13 @@ async def gutenberg_search(
     next_steps = ["\nNext steps:"]
     if next_offset < total_found:
         next_steps.append(
-            f"  • Continue  → gutenberg_search(query='{query}', offset={next_offset}, max_results={max_results}, ranker='{ranker}')"
+            f"  • Continue  → gutenberg_search(query='{query}', offset={next_offset}, "
+            f"max_results={max_results}, ranker='{ranker}')"
         )
     if offset > 0:
         next_steps.append(
-            f"  • Go back   → gutenberg_search(query='{query}', offset={prev_offset}, max_results={max_results}, ranker='{ranker}')"
+            f"  • Go back   → gutenberg_search(query='{query}', offset={prev_offset}, "
+            f"max_results={max_results}, ranker='{ranker}')"
         )
     next_steps.append(
         "  • Read text → read_book_content(book_id=<book_id>, start_char=<start_char>)"
