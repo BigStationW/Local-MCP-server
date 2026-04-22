@@ -659,36 +659,49 @@ async def read_book_content(
         cur = conn.cursor(_pymysql.cursors.DictCursor)
         cur.execute(
             "SELECT title, author, language, body, start_char FROM gutenberg_paragraphs "
-            "WHERE book_id = %s AND start_char >= %s "
-            "ORDER BY start_char ASC "
-            "LIMIT 50",
+            "WHERE book_id = %s AND start_char <= %s "
+            "ORDER BY start_char DESC "
+            "LIMIT 1",
             (book_id, start_char)
         )
-        rows = cur.fetchall()
+        containing_row = cur.fetchone()
+        if not containing_row:
+            return f"No content found for book_id={book_id} at start_char={start_char}."
+        containing_row = dict(containing_row)
+        offset_within_para = start_char - containing_row["start_char"]
+        containing_row["body"] = containing_row["body"][offset_within_para:]
+        containing_row["start_char"] = start_char
+        cur.execute(
+            "SELECT title, author, language, body, start_char FROM gutenberg_paragraphs "
+            "WHERE book_id = %s AND start_char > %s "
+            "ORDER BY start_char ASC "
+            "LIMIT 49",
+            (book_id, start_char)
+        )
+        rows = [containing_row] + cur.fetchall()
         conn.close()
     except Exception as e:
         return f"Database error: {type(e).__name__}: {e}"
 
-    if not rows:
-        return f"No content found for book_id={book_id} at start_char={start_char}."
-
     passage = ""
-    next_start = rows[-1]["start_char"] + len(rows[-1]["body"])
+    end_char = start_char
     for row in rows:
         chunk = row["body"]
         if max_chars > 0 and len(passage) + len(chunk) > max_chars:
-            passage += chunk[:max_chars - len(passage)]
-            next_start = row["start_char"] + len(chunk)
+            trimmed = chunk[:max_chars - len(passage)]
+            passage += trimmed
+            end_char += len(trimmed)
             break
         passage += chunk + "\n\n"
-        next_start = row["start_char"] + len(chunk)
+        end_char += len(chunk) + 2
+    next_start = end_char
 
     title = rows[0].get("title", "Unknown")
     author = rows[0].get("author", "Unknown")
     lang = rows[0].get("language", "Unknown")
     return "\n".join([
         f"Book: {title} by {author} (book_id={book_id}, language={lang})",
-        f"Passage starting at char {start_char} ({len(passage.strip())} chars returned)",
+        f"Passage starting at char {start_char}, ending at char {end_char} ({len(passage.strip())} chars returned)",
         f"\n{'=' * 60}\n",
         passage.strip(),
         f"\n{'=' * 60}",
