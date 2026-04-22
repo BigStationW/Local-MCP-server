@@ -586,8 +586,6 @@ async def gutenberg_search(
                     suffix_text  = body[frag_end_in_body:sent_end] + (" …" if suf_trunc else "")
                     full_display = prefix_text + frag + suffix_text
 
-                    full_display = re.sub(r'(?<!\n)\n(?!\n)', ' ', full_display)
-
                     result_parts.append(f"[{para_start + sent_start}] {full_display}")
                     last_end_pos = sent_end
                     search_pos = frag_end_in_body
