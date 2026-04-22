@@ -425,36 +425,22 @@ async def gutenberg_search(
         return "Empty query."
 
     def _build_fts_expression(fts_expr: str) -> tuple[str, list]:
-        """
-        Build a (sql, params) pair for a MATCH query.
-
-        The FTS expression is passed as a bound parameter (%s) so that
-        single quotes, backslashes and other special characters in the
-        user-supplied query can never break the SQL syntax.
-
-        Manticore's field-filter prefixes (@body, @author, @bookshelves)
-        and the proximity / fallback expressions are concatenated in Python
-        before being handed to pymysql as a single parameter value — that
-        is safe because pymysql's escaping operates at the *SQL string*
-        level, not inside the FTS grammar.
-        """
-        body_part = f"({fts_expr})" if (author or category) else fts_expr
-        author_part  = f" @author {author}"      if author   else ""
-        category_part = f" @bookshelves {category}" if category else ""
-        full_match = f"@body {body_part}{author_part}{category_part}"
+        author_part = f" @author {author}" if author else ""
+        full_match = f"@body ({fts_expr}){author_part}" if author else f"@body {fts_expr}"
 
         highlight_opts = (
             f"before_match='**', after_match='**', "
             f"limit={SNIPPET_LENGTH}, around=50"
         )
 
-        lang_filter = " AND language=%s" if language else ""
+        lang_filter      = " AND language=%s"              if language  else ""
+        category_filter  = " AND REGEX(bookshelves, %s)"      if category  else ""
 
         sql = (
             "SELECT book_id, title, author, language, bookshelves, start_char, body, "
             f"HIGHLIGHT({{{highlight_opts}}}, 'body') AS snippet "
             "FROM gutenberg_paragraphs "
-            f"WHERE MATCH(%s){lang_filter} "
+            f"WHERE MATCH(%s){lang_filter}{category_filter} "
             f"LIMIT {int(offset)}, {int(max_results)} "
             f"OPTION ranker={ranker}, field_weights=(body=10,title=1)"
         )
@@ -462,6 +448,8 @@ async def gutenberg_search(
         params: list = [full_match]
         if language:
             params.append(language[:5])
+        if category:
+            params.append(f".*{_re.escape(category)}.*")
 
         return sql, params
 
