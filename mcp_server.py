@@ -295,7 +295,7 @@ def _manticore_conn():
         charset="utf8mb4", connect_timeout=5,
     )
 
-MAX_EXPAND = 300  # max chars to expand beyond the fragment edge in either direction
+MAX_EXPAND = 100  # max chars to expand beyond the fragment edge in either direction
 
 def _sentence_bounds(text: str, frag_start: int, frag_end: int):
     # --- Backward: find sentence start ---
@@ -410,7 +410,7 @@ async def gutenberg_search(
         gutenberg_search(query="...", offset=10)              ← next page
         read_book_content(book_id=..., start_char=...)
     """
-    SNIPPET_LENGTH = 500
+    SNIPPET_LENGTH = 400
     VALID_RANKERS = {"proximity_bm25", "bm25", "sph04", "wordcount", "none"}
 
     if ranker not in VALID_RANKERS:
@@ -424,37 +424,56 @@ async def gutenberg_search(
     if not plain_words:
         return "Empty query."
 
-    def _escape_fts(q: str) -> str:
-        """Escape single quotes for SQL safety. Preserve all FTS operators."""
-        return q.replace("'", "''")
+    def _build_fts_expression(fts_expr: str) -> tuple[str, list]:
+        """
+        Build a (sql, params) pair for a MATCH query.
 
-    def _make_sql(fts_expr: str, use_ranker: str) -> str:
-        # When author/category filters are present, wrap the body expression in parens
-        # so the field anchors (@author, @bookshelves) apply at the right level.
-        body_part = f"({fts_expr})" if author or category else fts_expr
-        author_part = f" @author {_escape_fts(author)}" if author else ""
-        category_part = f" @bookshelves {_escape_fts(category)}" if category else ""
+        The FTS expression is passed as a bound parameter (%s) so that
+        single quotes, backslashes and other special characters in the
+        user-supplied query can never break the SQL syntax.
+
+        Manticore's field-filter prefixes (@body, @author, @bookshelves)
+        and the proximity / fallback expressions are concatenated in Python
+        before being handed to pymysql as a single parameter value — that
+        is safe because pymysql's escaping operates at the *SQL string*
+        level, not inside the FTS grammar.
+        """
+        body_part = f"({fts_expr})" if (author or category) else fts_expr
+        author_part  = f" @author {author}"      if author   else ""
+        category_part = f" @bookshelves {category}" if category else ""
         full_match = f"@body {body_part}{author_part}{category_part}"
-        fts_safe = _escape_fts(full_match)
-        lang_filter = f" AND language='{_escape_fts(language[:5])}'" if language else ""
 
-        highlight_opts = f"before_match='**', after_match='**', limit={SNIPPET_LENGTH}, around=20"
-
-        return (
-            f"SELECT book_id, title, author, language, bookshelves, start_char, body, "
-            f"HIGHLIGHT({{{highlight_opts}}}, 'body') AS snippet "
-            f"FROM gutenberg_paragraphs "
-            f"WHERE MATCH('{fts_safe}'){lang_filter} "
-            f"LIMIT {int(offset)}, {int(max_results)} "
-            f"OPTION ranker={use_ranker}, field_weights=(body=10,title=1)"
+        highlight_opts = (
+            f"before_match='**', after_match='**', "
+            f"limit={SNIPPET_LENGTH}, around=20"
         )
 
-    raw_fts       = _escape_fts(query)
+        lang_filter = " AND language=%s" if language else ""
+
+        sql = (
+            "SELECT book_id, title, author, language, bookshelves, start_char, body, "
+            f"HIGHLIGHT({{{highlight_opts}}}, 'body') AS snippet "
+            "FROM gutenberg_paragraphs "
+            f"WHERE MATCH(%s){lang_filter} "
+            f"LIMIT {int(offset)}, {int(max_results)} "
+            f"OPTION ranker={ranker}, field_weights=(body=10,title=1)"
+        )
+
+        params: list = [full_match]
+        if language:
+            params.append(language[:5])
+
+        return sql, params
+
+    # Build the three tiers of FTS expression (plain Python strings, no SQL escaping).
+    # These are passed as bound parameters, so apostrophes and special chars are fine.
+    raw_fts = query  # user query verbatim — apostrophes, quotes, | etc. all preserved
+
     proximity_fts = (
         plain_words[0] if len(plain_words) == 1
         else f" NEAR/{int(proximity)} ".join(plain_words)
     )
-    fallback_fts  = " ".join(plain_words)
+    fallback_fts = " ".join(plain_words)
 
     used_fallback  = False
     fallback_label = ""
@@ -463,17 +482,18 @@ async def gutenberg_search(
         conn = _manticore_conn()
         cur = conn.cursor(_pymysql.cursors.DictCursor)
 
-        # Tier 1: raw query (preserves |, "", -, etc.)
-        cur.execute(_make_sql(raw_fts, ranker))
+        # Tier 1: raw query (preserves |, "", -, apostrophes, etc.)
+        sql, params = _build_fts_expression(raw_fts)
+        cur.execute(sql, params)
         rows = cur.fetchall()
         cur.execute("SHOW META")
         meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
         total_found = int(meta.get("total_found", len(rows)))
 
-        # Tier 2: NEAR/N on plain words (only when raw returned nothing and
-        #          there are multiple words to constrain)
+        # Tier 2: NEAR/N on plain words
         if not rows and len(plain_words) > 1 and proximity_fts != raw_fts:
-            cur.execute(_make_sql(proximity_fts, ranker))
+            sql, params = _build_fts_expression(proximity_fts)
+            cur.execute(sql, params)
             rows = cur.fetchall()
             cur.execute("SHOW META")
             meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
@@ -484,7 +504,8 @@ async def gutenberg_search(
 
         # Tier 3: plain AND (broadest — last resort)
         if not rows and fallback_fts != proximity_fts:
-            cur.execute(_make_sql(fallback_fts, ranker))
+            sql, params = _build_fts_expression(fallback_fts)
+            cur.execute(sql, params)
             rows = cur.fetchall()
             cur.execute("SHOW META")
             meta = {r["Variable_name"]: r["Value"] for r in cur.fetchall()}
@@ -602,16 +623,17 @@ async def gutenberg_search(
 
     next_offset = offset + len(rows)
     prev_offset = max(0, offset - max_results)
+    safe_query = query.replace("'", "\\'")
 
     next_steps = ["\nNext steps:"]
     if next_offset < total_found:
         next_steps.append(
-            f"  • Continue  → gutenberg_search(query='{query}', offset={next_offset}, "
+            f"  • Continue  → gutenberg_search(query='{safe_query}', offset={next_offset}, "
             f"max_results={max_results}, ranker='{ranker}')"
         )
     if offset > 0:
         next_steps.append(
-            f"  • Go back   → gutenberg_search(query='{query}', offset={prev_offset}, "
+            f"  • Go back   → gutenberg_search(query='{safe_query}', offset={prev_offset}, "
             f"max_results={max_results}, ranker='{ranker}')"
         )
     next_steps.append(
