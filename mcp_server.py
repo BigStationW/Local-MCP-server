@@ -410,7 +410,7 @@ async def gutenberg_search(
         gutenberg_search(query="...", offset=10)              ← next page
         read_book_content(book_id=..., start_char=...)
     """
-    SNIPPET_LENGTH = 400
+    SNIPPET_LENGTH = 500
     VALID_RANKERS = {"proximity_bm25", "bm25", "sph04", "wordcount", "none"}
 
     if ranker not in VALID_RANKERS:
@@ -445,7 +445,7 @@ async def gutenberg_search(
 
         highlight_opts = (
             f"before_match='**', after_match='**', "
-            f"limit={SNIPPET_LENGTH}, around=20"
+            f"limit={SNIPPET_LENGTH}, around=50"
         )
 
         lang_filter = " AND language=%s" if language else ""
@@ -597,6 +597,8 @@ async def gutenberg_search(
                     prefix_text = ("… " if pre_trunc else "") + body[sent_start:pos]
                     suffix_text  = body[frag_end_in_body:sent_end] + (" …" if suf_trunc else "")
                     full_display = prefix_text + frag + suffix_text
+
+                    full_display = re.sub(r'(?<!\n)\n(?!\n)', ' ', full_display)
 
                     result_parts.append(f"[{para_start + sent_start}] {full_display}")
                     last_end_pos = sent_end
