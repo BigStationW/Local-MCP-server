@@ -553,10 +553,12 @@ async def gutenberg_search(
         snippet = (row.get("snippet") or "").strip()
         body = row.get("body") or ""
         para_start = row['start_char']
+        fragment_start_char = None
 
         # HIGHLIGHT() may return empty for very short paragraphs; degrade gracefully
         if not snippet:
             body_text = (row.get("body") or "").strip()
+            fragment_start_char = para_start
             if len(body_text) <= SNIPPET_LENGTH:
                 snippet = f"[{para_start}] {body_text}"
                 end_char = para_start + len(body_text)
@@ -582,6 +584,9 @@ async def gutenberg_search(
 
                     sent_start, sent_end, pre_trunc, suf_trunc = _sentence_bounds(body, pos, frag_end_in_body)
 
+                    if fragment_start_char is None:
+                        fragment_start_char = para_start + sent_start
+
                     prefix_text = ("… " if pre_trunc else "") + body[sent_start:pos]
                     suffix_text  = body[frag_end_in_body:sent_end] + (" …" if suf_trunc else "")
                     full_display = prefix_text + frag + suffix_text
@@ -604,7 +609,7 @@ async def gutenberg_search(
         cat_str = f"   categories: {bookshelves}\n" if bookshelves else ""
         lines.append(
             f"{i}. {row['title']} by {row['author']}\n"
-            f"   book_id: {row['book_id']} | start_char: {row['start_char']} | end_char: {end_char}\n"
+            f"   book_id: {row['book_id']} | start_char: {fragment_start_char or row['start_char']} | end_char: {end_char}\n"
             f"{cat_str}"
             f"   Match: {snippet}\n\n"
         )
