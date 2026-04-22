@@ -1219,7 +1219,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--port", "-p",
         type=int,
-        default=4242,
+        default=SERVER_PORT,
         help="Port to run the server on (default: 4242)"
     )
     args = parser.parse_args()
