@@ -499,11 +499,16 @@ def build_zip_urls(book_id):
                 urls.append(f"{base}/files/{sid}/{sid}-0.txt")
                 urls.append(f"{base}/files/{sid}/{sid}-8.txt")
                 urls.append(f"{base}/files/{sid}/{sid}.txt")
+
+                urls.append(f"{base}/{dir_path}/{sid}-0.txt")
+                urls.append(f"{base}/{dir_path}/{sid}-8.txt")
+                urls.append(f"{base}/{dir_path}/{sid}.txt")
+
                 urls.append(f"{base}/{dir_path}/{sid}-0.zip")
                 urls.append(f"{base}/{dir_path}/{sid}-8.zip")
                 urls.append(f"{base}/{dir_path}/{sid}.zip")
 
-    return [u for u in urls if not _is_blocked(u)]
+    return urls
 
 def _decode_raw_text(data, hint=None, book_id=None):
     header = data[:2000].decode("ascii", errors="ignore")
@@ -541,13 +546,18 @@ def _decode_zip(data, book_id=None):
 
 def download_text(book_id):
     ctx = _ssl_ctx()
-
+    printed_blocked_bases = set() 
+    
     for url in build_zip_urls(book_id):
         if _is_blocked(url):
-            print(f"    [BLOCKED] {url}")
-            print(f"              Host blocked this session, skipping.")
+            base_url = next((base for base in _blocked_hosts if url.startswith(base)), "Unknown Host")
+            
+            # Print the warning only if we haven't already for this base URL
+            if base_url not in printed_blocked_bases:
+                print(f"    [BLOCKED] {base_url}")
+                print(f"              Host blocked this session, skipping.")
+                printed_blocked_bases.add(base_url)
             continue
-
         try:
             req = urllib.request.Request(url, headers=CUSTOM_HEADERS)
             with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
