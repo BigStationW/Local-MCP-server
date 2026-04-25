@@ -63,7 +63,7 @@ MIRRORS = [
         "has_catalog": False,    # cache folder exists but feeds not synced
         "has_cache_txt": False,
         "has_files": True,
-        "has_files_simple": True,   # only {id}.zip and {id}.txt exist, no /files/, no -0/-8
+        "has_files_simple": False,
         "epub_prefix": None,
     },
 ]
