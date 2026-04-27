@@ -341,49 +341,64 @@ def bulk_insert(conn, rows):
 def sync_metadata_if_changed(conn, book_id, new_title, new_author, new_bookshelves):
     """
     Checks if a book's metadata has changed and updates it if necessary.
-    Returns True if the book was found (and updated or was already correct), 
+    Returns True if the book was found (and updated or was already correct),
     False if the book is not in the index yet.
     """
-    cur = conn.cursor(pymysql.cursors.DictCursor) # Use a DictCursor for easy column access
-    
-    # Fetch one row for the given book_id to check its current metadata
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+
+    # Fetch all rows for the given book_id to check current metadata
     cur.execute(
-        "SELECT title, author, bookshelves FROM gutenberg_paragraphs WHERE book_id = %s LIMIT 1",
+        "SELECT id, title, author, language, bookshelves, start_char, body "
+        "FROM gutenberg_paragraphs WHERE book_id = %s",
         (book_id,)
     )
-    
-    result = cur.fetchone()
-    
+    rows = cur.fetchall()
+
     # Case 1: Book is not in the index at all.
-    if not result:
+    if not rows:
         return False
 
-    # Case 2: Book exists. Compare its metadata with the new catalog data.
-    # Note: Manticore may return bytes, so we decode for a safe comparison.
-    current_title = result['title']
-    current_author = result['author']
-    current_bookshelves = result['bookshelves']
-    
-    if (current_title != new_title or 
-        current_author != new_author or 
+    # Case 2: Book exists. Compare metadata using the first row.
+    first = rows[0]
+    current_title      = first['title']
+    current_author     = first['author']
+    current_bookshelves = first['bookshelves']
+
+    if (current_title != new_title or
+        current_author != new_author or
         current_bookshelves != new_bookshelves):
-        
+
         print("    Metadata has changed. Updating...")
-        
-        # Use a normal cursor for the UPDATE command
+
+        # Manticore cannot UPDATE full-text (text) fields.
+        # Strategy: delete all paragraphs for this book, then re-insert them
+        # with the corrected metadata.
         update_cur = conn.cursor()
+
+        # 1. Delete old rows
         update_cur.execute(
-            """
-            UPDATE gutenberg_paragraphs 
-            SET title=%s, author=%s, bookshelves=%s 
-            WHERE book_id=%s
-            """,
-            (new_title, new_author, new_bookshelves, book_id)
+            "DELETE FROM gutenberg_paragraphs WHERE book_id = %s",
+            (book_id,)
         )
         conn.commit()
+
+        # 2. Re-insert with updated title/author/bookshelves
+        new_rows = [
+            (
+                book_id,
+                new_title,
+                new_author,
+                row['language'],
+                new_bookshelves,
+                row['start_char'],
+                row['body'],
+            )
+            for row in rows
+        ]
+        bulk_insert(conn, new_rows)
         print("    [OK] Updated.")
 
-    # The book exists, so we don't need to re-download its text content.
+    # Book exists — no need to re-download text.
     return True
 
 # ============================================================
